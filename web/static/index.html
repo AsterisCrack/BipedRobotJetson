@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Biped Robot Control</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <!-- Import map must come before any module scripts.
+       Maps bare specifiers used internally by urdf-loader to CDN URLs. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three":                "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/":        "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "three/examples/jsm/":  "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header>
+    <span class="logo">Biped Robot</span>
+    <nav>
+      <button class="tab-btn active" data-tab="servos">Servos</button>
+      <button class="tab-btn" data-tab="imu">IMU</button>
+      <button class="tab-btn" data-tab="robot">Robot</button>
+      <button class="tab-btn" data-tab="debug">Debug</button>
+    </nav>
+    <div class="ws-status" id="ws-status">Connecting…</div>
+  </header>
+
+  <!-- SERVOS TAB -->
+  <div class="tab-panel active" id="tab-servos">
+    <div class="panel-toolbar">
+      <button id="btn-enable-all">Enable All Torques</button>
+      <button id="btn-disable-all">Disable All Torques</button>
+    </div>
+    <div class="table-wrapper">
+      <table id="servo-table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Joint</th><th>Position °</th><th>Speed</th>
+            <th>Load %</th><th>Voltage V</th><th>Temp °C</th>
+            <th>Torque</th><th>Move</th><th>Config</th>
+          </tr>
+        </thead>
+        <tbody id="servo-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- IMU TAB -->
+  <div class="tab-panel" id="tab-imu">
+    <div class="imu-grid">
+      <div class="imu-card">
+        <h3>Orientation (Euler)</h3>
+        <div class="imu-row"><span>Roll</span>  <span class="imu-val" id="imu-roll">0.00</span> °</div>
+        <div class="imu-row"><span>Pitch</span> <span class="imu-val" id="imu-pitch">0.00</span> °</div>
+        <div class="imu-row"><span>Yaw</span>   <span class="imu-val" id="imu-yaw">0.00</span> °</div>
+        <svg id="horizon" viewBox="-60 -60 120 120" width="160" height="160">
+          <circle cx="0" cy="0" r="58" fill="#1a1a2e" stroke="#444" stroke-width="1"/>
+          <rect id="horizon-sky"   x="-60" y="-60" width="120" height="60" fill="#1d4e89" opacity="0.8"/>
+          <rect id="horizon-gnd"   x="-60" y="0"   width="120" height="60" fill="#6b3a1f" opacity="0.8"/>
+          <line x1="-50" y1="0" x2="50" y2="0" stroke="#fff" stroke-width="1"/>
+          <line x1="-8" y1="0" x2="-25" y2="0" stroke="#0f0" stroke-width="2"/>
+          <line x1="8"  y1="0" x2="25"  y2="0" stroke="#0f0" stroke-width="2"/>
+          <circle cx="0" cy="0" r="3" fill="#0f0"/>
+          <clipPath id="circle-clip"><circle cx="0" cy="0" r="58"/></clipPath>
+        </svg>
+      </div>
+      <div class="imu-card">
+        <h3>Quaternion</h3>
+        <div class="imu-row"><span>W</span><span class="imu-val" id="imu-qw">1.0000</span></div>
+        <div class="imu-row"><span>X</span><span class="imu-val" id="imu-qx">0.0000</span></div>
+        <div class="imu-row"><span>Y</span><span class="imu-val" id="imu-qy">0.0000</span></div>
+        <div class="imu-row"><span>Z</span><span class="imu-val" id="imu-qz">0.0000</span></div>
+        <h3 style="margin-top:1rem">Calibration</h3>
+        <div class="cal-dots" id="cal-dots">
+          <span class="dot" title="Gyro"></span>
+          <span class="dot" title="Accel"></span>
+          <span class="dot" title="Mag"></span>
+          <span class="dot" title="Overall"></span>
+        </div>
+        <button id="btn-calibrate" style="margin-top:.8rem">Calibrate</button>
+      </div>
+      <div class="imu-card">
+        <h3>Accelerometer m/s²</h3>
+        <div class="imu-row"><span>X</span><span class="imu-val" id="imu-ax">0.000</span></div>
+        <div class="imu-row"><span>Y</span><span class="imu-val" id="imu-ay">0.000</span></div>
+        <div class="imu-row"><span>Z</span><span class="imu-val" id="imu-az">9.810</span></div>
+        <h3 style="margin-top:1rem">Gyroscope rad/s</h3>
+        <div class="imu-row"><span>X</span><span class="imu-val" id="imu-gx">0.0000</span></div>
+        <div class="imu-row"><span>Y</span><span class="imu-val" id="imu-gy">0.0000</span></div>
+        <div class="imu-row"><span>Z</span><span class="imu-val" id="imu-gz">0.0000</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ROBOT TAB -->
+  <div class="tab-panel" id="tab-robot">
+    <div class="robot-layout">
+      <div id="viewer-container"></div>
+      <div class="robot-controls">
+        <div class="control-section">
+          <h3>Poses</h3>
+          <div id="pose-buttons" class="pose-row"></div>
+        </div>
+
+        <div class="control-section">
+          <h3>IK — Left Foot (m)</h3>
+          <div id="ik-left" class="ik-group" data-leg="left"></div>
+        </div>
+        <div class="control-section">
+          <h3>IK — Right Foot (m)</h3>
+          <div id="ik-right" class="ik-group" data-leg="right"></div>
+        </div>
+
+        <div class="control-section collapsible">
+          <h3 class="collapse-header">FK — Left Leg <span class="arrow">▸</span></h3>
+          <div id="fk-left" class="fk-group collapse-body hidden" data-leg="left"></div>
+        </div>
+        <div class="control-section collapsible">
+          <h3 class="collapse-header">FK — Right Leg <span class="arrow">▸</span></h3>
+          <div id="fk-right" class="fk-group collapse-body hidden" data-leg="right"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DEBUG TAB -->
+  <div class="tab-panel" id="tab-debug">
+    <div class="debug-page">
+      <section class="debug-card">
+        <h3>Reassign Servo IDs</h3>
+        <p class="hint">ID register is 0x05 (EPROM). Only one servo should be on the bus when changing IDs.</p>
+        <div class="id-actions">
+          <button id="id-refresh">Refresh List</button>
+          <button id="id-disable-all" class="danger">Disable All Torques</button>
+          <span class="id-status" id="id-status"></span>
+        </div>
+        <div class="table-wrapper">
+          <table id="id-table">
+            <thead>
+              <tr>
+                <th>Current ID</th><th>Joint</th><th>New ID</th><th>Action</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="id-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="debug-card">
+        <h3>Manual Change</h3>
+        <p class="hint">Use this when only a single servo is connected.</p>
+        <div class="id-form">
+          <label>Current ID <input type="number" id="id-old" min="0" max="253" value="1"></label>
+          <label>New ID <input type="number" id="id-new" min="0" max="253" value="1"></label>
+          <button id="id-apply-manual" class="primary">Apply</button>
+        </div>
+      </section>
+
+      <section class="debug-card debug-span-2">
+        <h3>Single Servo Control</h3>
+        <p class="hint">Torque is forced off when selecting or scanning for IDs.</p>
+        <div class="debug-row">
+          <label>Active ID
+            <select id="debug-servo-select"></select>
+          </label>
+          <label>Manual ID <input type="number" id="debug-servo-id" min="0" max="253" value="1"></label>
+          <button id="debug-use-id" class="primary">Use ID</button>
+          <button id="debug-scan">Look For IDs</button>
+          <span class="id-status" id="debug-status"></span>
+        </div>
+        <div class="debug-row">
+          <label class="debug-toggle">Torque <input type="checkbox" id="debug-torque-toggle"></label>
+          <button id="debug-zero" class="danger">Set Current As Zero (config)</button>
+        </div>
+
+        <div class="debug-grid">
+          <div class="debug-control">
+            <label>Position (steps)</label>
+            <div class="debug-inline">
+              <input type="range" id="debug-position" min="0" max="4095" step="1" value="2048">
+              <input type="number" id="debug-position-val" step="1" value="2048">
+              <button id="debug-move" class="primary">Move</button>
+            </div>
+          </div>
+          <div class="debug-control">
+            <label>Speed (step/s)</label>
+            <div class="debug-inline">
+              <input type="range" id="debug-speed" min="0" max="3400" step="10" value="300">
+              <input type="number" id="debug-speed-val" min="0" max="3400" step="10" value="300">
+              <button id="debug-speed-apply">Apply</button>
+            </div>
+          </div>
+          <div class="debug-control">
+            <label>Acceleration (100 step/s²)</label>
+            <div class="debug-inline">
+              <input type="range" id="debug-accel" min="0" max="254" step="1" value="10">
+              <input type="number" id="debug-accel-val" min="0" max="254" step="1" value="10">
+              <button id="debug-accel-apply">Apply</button>
+            </div>
+          </div>
+          <div class="debug-control">
+            <label>Torque Limit (0-1000)</label>
+            <div class="debug-inline">
+              <input type="range" id="debug-torque-limit" min="0" max="1000" step="10" value="1000">
+              <input type="number" id="debug-torque-limit-val" min="0" max="1000" step="10" value="1000">
+              <button id="debug-torque-limit-apply">Apply</button>
+            </div>
+          </div>
+          <div class="debug-control">
+            <label>PID (P / D / I)</label>
+            <div class="debug-inline">
+              <input type="number" id="debug-p" min="0" max="254" value="32">
+              <input type="number" id="debug-d" min="0" max="254" value="16">
+              <input type="number" id="debug-i" min="0" max="254" value="0">
+              <button id="debug-pid-apply" class="primary">Apply</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="debug-card debug-span-2">
+        <h3>Live Telemetry</h3>
+        <canvas id="debug-graph" width="960" height="280"></canvas>
+        <div class="debug-legend" id="debug-legend"></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal-overlay hidden" id="modal-overlay">
+    <div class="modal" id="modal-pid">
+      <h3>PID — <span id="modal-pid-title"></span></h3>
+      <label>P <input type="number" id="pid-p" min="0" max="254"></label>
+      <label>D <input type="number" id="pid-d" min="0" max="254"></label>
+      <label>I <input type="number" id="pid-i" min="0" max="254"></label>
+      <div class="modal-actions">
+        <button id="pid-apply">Apply</button>
+        <button id="pid-cancel">Cancel</button>
+      </div>
+    </div>
+    <div class="modal hidden" id="modal-id">
+      <h3>Set ID — Servo <span id="modal-id-title"></span></h3>
+      <p class="warn">Disable torque and reconnect after changing ID.</p>
+      <label>New ID (0-253) <input type="number" id="new-servo-id" min="0" max="253"></label>
+      <div class="modal-actions">
+        <button id="id-apply">Apply</button>
+        <button id="id-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
