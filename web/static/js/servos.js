@@ -46,11 +46,12 @@ function _createRow(s) {
   const tbody = document.getElementById('servo-tbody');
   const tr = document.createElement('tr');
   tr.dataset.id = s.id;
+  const displayDeg = s.logical_deg ?? s.position_deg;
   tr.innerHTML = `
     <td class="s-id">${s.id}</td>
     <td class="s-joint" title="${s.joint}">${_shortName(s.joint)}</td>
-    <td><input type="range" class="pos-slider" min="-180" max="180" step="0.5" value="${s.position_deg}">
-        <span class="pos-value">${s.position_deg.toFixed(1)}°</span></td>
+    <td><input type="range" class="pos-slider" min="-180" max="180" step="0.5" value="${displayDeg}">
+        <span class="pos-value">${displayDeg.toFixed(1)}°</span></td>
     <td class="s-speed">0</td>
     <td class="s-load">0</td>
     <td class="s-voltage">0.0</td>
@@ -101,10 +102,11 @@ function _createRow(s) {
 function _updateRow(s) {
   const r = rows[s.id];
   if (!r) return;
+  const displayDeg = s.logical_deg ?? s.position_deg;
   // Only update slider if user is not actively dragging
   if (document.activeElement !== r.slider) {
-    r.slider.value = s.position_deg;
-    r.valSpan.textContent = `${s.position_deg.toFixed(1)}°`;
+    r.slider.value = displayDeg;
+    r.valSpan.textContent = `${displayDeg.toFixed(1)}°`;
   }
   _setText(r.speed, s.speed);
   _setText(r.load,  `${(s.load / 10).toFixed(0)}%`);

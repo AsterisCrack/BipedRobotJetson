@@ -61,6 +61,21 @@ def encode_action(id_: int = 0xFE) -> bytes:
     return encode_packet(id_, Instr.ACTION)
 
 
+def encode_sync_read(register: int, data_len: int, servo_ids: list[int]) -> bytes:
+    """
+    Build a SYNC_READ broadcast packet.
+
+    Each listed servo will respond in turn with data_len bytes starting at register.
+
+    Args:
+        register:  starting register address
+        data_len:  bytes to read per servo
+        servo_ids: list of servo IDs to query
+    """
+    params = bytes([register, data_len] + servo_ids)
+    return encode_packet(0xFE, Instr.SYNC_READ, params)
+
+
 def encode_sync_write(
     register: int,
     data_len: int,

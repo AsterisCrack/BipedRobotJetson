@@ -101,6 +101,52 @@ class SerialBus:
 
             return self._read_response(response_data_len)
 
+    def sync_read(
+        self, packet: bytes, servo_ids: list[int], data_len: int
+    ) -> dict[int, bytes]:
+        """
+        Send a SYNC_READ broadcast and collect one response per servo.
+
+        Holds the bus lock for the entire transaction so no other transfer
+        can interleave between the request and the N responses.
+
+        Args:
+            packet:    fully-encoded SYNC_READ instruction packet
+            servo_ids: ordered list of servo IDs expected to respond
+            data_len:  payload bytes expected in each response
+
+        Returns:
+            {servo_id: data_bytes} for every servo that replied successfully.
+            Servos that time out or return bad checksums are silently omitted.
+        """
+        if not self.is_open:
+            raise SerialBusError("Serial bus is not open")
+
+        results: dict[int, bytes] = {}
+        with self._lock:
+            self._serial.reset_input_buffer()
+            self._serial.write(packet)
+            self._serial.flush()
+
+            if self._expect_echo:
+                echo = self._serial.read(len(packet))
+                if len(echo) == 0:
+                    self._expect_echo = False
+                elif len(echo) != len(packet):
+                    raise SerialBusError(
+                        f"SYNC_READ echo drain incomplete: "
+                        f"expected {len(packet)} bytes, got {len(echo)}"
+                    )
+
+            for sid in servo_ids:
+                try:
+                    data = self._read_response(data_len)
+                    results[sid] = data
+                except SerialBusError as exc:
+                    logger.debug("SYNC_READ: no response from servo %d: %s", sid, exc)
+
+        return results
+
     def send_no_reply(self, packet: bytes) -> None:
         """Send a broadcast packet that expects no response (e.g. SYNC_WRITE)."""
         if not self.is_open:

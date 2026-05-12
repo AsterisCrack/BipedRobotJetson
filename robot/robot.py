@@ -10,8 +10,8 @@ import numpy as np
 from robot.config import ServoConfig, Settings
 from robot.hardware.imu.bno085 import BNO085, IMUReading
 from robot.hardware.serial_bus import SerialBus, SerialBusError
-from robot.hardware.st3215.protocol import encode_ping, encode_sync_write, steps_to_bytes, pack_u16
-from robot.hardware.st3215.registers import Reg
+from robot.hardware.servo_bus_manager import ServoBusManager
+from robot.hardware.st3215.protocol import encode_ping
 from robot.hardware.st3215.servo import ST3215, ServoStatus
 from robot.kinematics.chain import KinematicChain
 from robot.kinematics.solver import IKResult, KinematicSolver
@@ -23,14 +23,22 @@ class Robot:
     """
     Central orchestrator.  Owns all hardware objects and the telemetry loop.
 
-    Servo objects are always built from config regardless of hardware availability,
-    so the frontend always receives valid telemetry frames (with simulated/cached
-    positions when the bus is offline).
+    Two coordinate spaces:
+      - URDF space:    0° = physical servo center after zero_offset_steps /
+                       direction_sign correction.  Used by FK/IK solver and
+                       servo driver internals.
+      - Logical space: 0° = calibrated standing position (default_position_deg).
+                       Used in poses, sliders, and telemetry display.
+                       logical = urdf − default_position_deg
+
+    All public motion commands (sync_write_positions, go_to_pose, …) accept
+    logical angles by default.  Pass raw=True to bypass the offset and send
+    URDF angles directly (Debug tab only).
 
     Typical lifecycle:
         robot = Robot(settings)
         robot.initialize()           # opens hardware — non-fatal if unavailable
-        robot.start_telemetry(q)     # background thread → asyncio queue at 20 Hz
+        robot.start_telemetry(q)     # background thread → asyncio queue
         ...
         robot.shutdown()
     """
@@ -57,10 +65,21 @@ class Robot:
             self._servos[cfg.joint_name] = servo
             self._servos_by_id[cfg.servo_id] = servo
 
-        # Cached positions used when hardware reads fail (sim / offline mode).
+        # default_position_deg offsets: logical zero → URDF angle.
+        self._default_offsets: dict[str, float] = {
+            cfg.joint_name: cfg.default_position_deg
+            for cfg in settings.robot.servos
+        }
+
+        # Cached URDF positions used when BusManager has no data yet.
         self._cached_positions: dict[str, float] = {
             cfg.joint_name: cfg.default_position_deg for cfg in settings.robot.servos
         }
+
+        # Bus manager: owns the serial bus in a dedicated 50 Hz thread.
+        self._bus_manager = ServoBusManager(
+            list(self._servos.values()), self._bus, self._imu
+        )
 
         self._telemetry_thread: threading.Thread | None = None
         self._stop_telemetry = threading.Event()
@@ -74,6 +93,7 @@ class Robot:
             self._bus.open()
         except Exception as exc:
             logger.warning("Serial bus unavailable (%s) — running without servos", exc)
+            self._bus_manager.start()
             return
 
         # Ping all servos (non-fatal)
@@ -97,12 +117,16 @@ class Robot:
         except Exception as exc:
             logger.warning("IMU unavailable (%s) — running without IMU", exc)
 
+        # Start bus manager loop AFTER hardware is ready
+        self._bus_manager.start()
+
         logger.info("Robot initialised — %d servos, bus=%s", len(self._servos), self._bus.is_open)
 
     def shutdown(self) -> None:
         self._stop_telemetry.set()
         if self._telemetry_thread and self._telemetry_thread.is_alive():
             self._telemetry_thread.join(timeout=2.0)
+        self._bus_manager.stop()
         try:
             self.disable_all_torques()
         except Exception:
@@ -178,107 +202,102 @@ class Robot:
     # Motion
     # ------------------------------------------------------------------
 
-    def sync_write_positions(self, joint_angles: dict[str, float], speed: int = 300) -> None:
-        """Send a SYNC_WRITE broadcast to move all listed joints simultaneously."""
-        # Update cache regardless of bus state so FK/IK stay consistent
-        self._cached_positions.update(joint_angles)
+    def sync_write_positions(
+        self, joint_angles: dict[str, float], speed: int = 300, raw: bool = False
+    ) -> None:
+        """
+        Send target positions to the bus manager command buffer (non-blocking).
 
-        if not self._bus.is_open:
-            return
+        Args:
+            joint_angles: joint_name → angle in logical space (0 = default
+                          standing) unless raw=True.
+            speed:        servo movement speed (steps/s).
+            raw:          if True, treat angles as URDF space (no offset added).
+                          Use only for Debug-tab direct servo control.
+        """
+        if raw:
+            urdf_angles = joint_angles
+        else:
+            urdf_angles = {
+                name: deg + self._default_offsets.get(name, 0.0)
+                for name, deg in joint_angles.items()
+            }
 
-        servo_data: list[tuple[int, bytes]] = []
-        for joint_name, deg in joint_angles.items():
-            servo = self._servos.get(joint_name)
-            if servo is None:
-                continue
-            steps = servo.deg_to_steps(deg)
-            data = steps_to_bytes(steps) + pack_u16(speed)
-            servo_data.append((servo.servo_id, data))
-
-        if servo_data:
-            packet = encode_sync_write(Reg.TARGET_POS_L, 4, servo_data)
-            self._bus.send_no_reply(packet)
+        # Keep cache in URDF space for FK/IK warm-start.
+        self._cached_positions.update(urdf_angles)
+        self._bus_manager.set_target_positions(urdf_angles, speed)
 
     def go_to_pose(self, pose_name: str, speed: int = 300) -> None:
+        """Send robot to a named pose. Pose angles are in logical space."""
         if pose_name not in self._settings.robot.poses:
             raise KeyError(f"Unknown pose: {pose_name!r}")
         self.sync_write_positions(self._settings.robot.poses[pose_name], speed=speed)
+
+    def go_to_defaults(self, speed: int = 300) -> None:
+        """Send all joints to logical zero (= calibrated standing position)."""
+        self.sync_write_positions({name: 0.0 for name in self._servos}, speed=speed)
 
     # ------------------------------------------------------------------
     # IK / FK
     # ------------------------------------------------------------------
 
     def set_foot_position(self, leg: str, x: float, y: float, z: float) -> IKResult:
-        current = self.get_current_joint_angles_deg(leg)
+        """IK solver — runs in caller's thread; use run_in_executor from async code."""
+        current = self._get_current_urdf_angles(leg)
         result = self._solver.ik(leg, target_pos=np.array([x, y, z]), initial_angles_deg=current)
         if result.success:
             names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
-            self.sync_write_positions(dict(zip(names, result.angles_deg)))
+            # result.angles_deg is in URDF space; send raw=True
+            self.sync_write_positions(dict(zip(names, result.angles_deg)), raw=True)
         return result
 
     def get_foot_position(self, leg: str) -> dict:
-        return self._solver.fk(leg, self.get_current_joint_angles_deg(leg))
+        return self._solver.fk(leg, self._get_current_urdf_angles(leg))
+
+    def _get_current_urdf_angles(self, leg: str) -> list[float]:
+        """Return current joint angles in URDF space from bus manager cache."""
+        names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
+        cached = self._bus_manager.get_cached_positions()
+        return [
+            cached.get(name, self._cached_positions.get(name, self._default_offsets.get(name, 0.0)))
+            for name in names
+        ]
 
     def get_current_joint_angles_deg(self, leg: str) -> list[float]:
-        names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
-        angles = []
-        for name in names:
-            servo = self._servos.get(name)
-            if servo is None or not self._bus.is_open:
-                angles.append(self._cached_positions.get(name, 0.0))
-                continue
-            try:
-                pos = servo.get_position()
-                self._cached_positions[name] = pos
-                angles.append(pos)
-            except SerialBusError:
-                angles.append(self._cached_positions.get(name, 0.0))
-        return angles
+        """Kept for backwards compatibility — returns URDF angles."""
+        return self._get_current_urdf_angles(leg)
 
     def compute_fk(self, leg: str, angles_deg: list[float]) -> dict:
         return self._solver.fk(leg, angles_deg)
 
     # ------------------------------------------------------------------
-    # Status reads
+    # Status reads (non-blocking — reads from bus manager cache)
     # ------------------------------------------------------------------
 
     def get_all_statuses(self) -> list[ServoStatus]:
-        statuses = []
-        for servo in self._servos.values():
-            if not self._bus.is_open:
-                # Return a mock status from cache so the frontend always gets data
-                statuses.append(ServoStatus(
-                    servo_id=servo.servo_id,
-                    joint_name=servo.joint_name,
-                    position_deg=round(self._cached_positions.get(servo.joint_name, 0.0), 2),
-                        raw_steps=0,
-                        raw_deg=0.0,
-                    speed=0,
-                    load=0,
-                    voltage_v=0.0,
-                    temperature_c=0,
-                    torque_enabled=servo.torque_enabled,
-                ))
-                continue
-            try:
-                status = servo.get_status()
-                self._cached_positions[servo.joint_name] = status.position_deg
-                statuses.append(status)
-            except SerialBusError as exc:
-                logger.debug("Status read failed for %s: %s", servo.joint_name, exc)
-                statuses.append(ServoStatus(
-                    servo_id=servo.servo_id,
-                    joint_name=servo.joint_name,
-                    position_deg=round(self._cached_positions.get(servo.joint_name, 0.0), 2),
-                    raw_steps=0,
-                    raw_deg=0.0,
-                    speed=0, load=0, voltage_v=0.0, temperature_c=0,
-                    torque_enabled=servo.torque_enabled,
-                ))
-        return statuses
+        states = self._bus_manager.get_servo_states()
+        if states:
+            return states
+
+        # Bus manager has no data yet (startup) — return cached mock statuses.
+        return [
+            ServoStatus(
+                servo_id=servo.servo_id,
+                joint_name=servo.joint_name,
+                position_deg=round(self._cached_positions.get(servo.joint_name, 0.0), 2),
+                raw_steps=0,
+                raw_deg=0.0,
+                speed=0,
+                load=0,
+                voltage_v=0.0,
+                temperature_c=0,
+                torque_enabled=servo.torque_enabled,
+            )
+            for servo in self._servos.values()
+        ]
 
     def get_imu(self) -> IMUReading:
-        return self._imu.read()
+        return self._bus_manager.get_imu_state()
 
     # ------------------------------------------------------------------
     # Telemetry loop
@@ -303,6 +322,7 @@ class Robot:
         while not self._stop_telemetry.is_set():
             t_start = time.monotonic()
 
+            # All reads are non-blocking — bus manager owns the hardware.
             statuses = self.get_all_statuses()
             imu = self.get_imu()
             left_foot  = self.get_foot_position("left")
@@ -311,11 +331,15 @@ class Robot:
             frame = {
                 "type": "telemetry",
                 "timestamp": time.time(),
+                "bus_hz": round(self._bus_manager.cycle_hz, 1),
                 "servos": [
                     {
                         "id": s.servo_id,
                         "joint": s.joint_name,
                         "position_deg": s.position_deg,
+                        "logical_deg": round(
+                            s.position_deg - self._default_offsets.get(s.joint_name, 0.0), 2
+                        ),
                         "raw_steps": s.raw_steps,
                         "raw_deg": s.raw_deg,
                         "speed": s.speed,

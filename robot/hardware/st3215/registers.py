@@ -69,6 +69,7 @@ class Instr:
     REG_WRITE  = 0x04   # buffer write; executes on ACTION
     ACTION     = 0x05   # execute all buffered REG_WRITEs simultaneously
     RESET      = 0x06
+    SYNC_READ  = 0x82   # broadcast read from multiple servos; each responds in turn
     SYNC_WRITE = 0x83   # broadcast write to multiple servos in one packet
 
 

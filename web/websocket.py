@@ -7,6 +7,8 @@ import logging
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
+from robot.kinematics.chain import KinematicChain
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,8 +70,13 @@ class TelemetryBroadcaster:
 
         try:
             if msg_type == "set_position":
+                # raw=True → Debug tab (URDF space); raw=False → Servos tab (logical space)
                 servo = robot.get_servo_by_id(msg["servo_id"])
-                servo.set_position(float(msg["position_deg"]))
+                is_raw = bool(msg.get("raw", False))
+                robot.sync_write_positions(
+                    {servo.joint_name: float(msg["position_deg"])},
+                    raw=is_raw,
+                )
                 await _ack(ws, msg_type, servo_id=msg["servo_id"])
 
             elif msg_type == "set_torque":
@@ -87,25 +94,48 @@ class TelemetryBroadcaster:
                 await _ack(ws, msg_type)
 
             elif msg_type == "set_foot_ik":
+                # Run IK in thread pool so the event loop stays responsive.
                 leg = msg["leg"]
-                result = robot.set_foot_position(leg, float(msg["x"]), float(msg["y"]), float(msg["z"]))
+                x, y, z = float(msg["x"]), float(msg["y"]), float(msg["z"])
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, robot.set_foot_position, leg, x, y, z
+                )
+                # result.angles_deg is URDF space; convert to logical for UI.
+                names = (
+                    KinematicChain.LEFT_JOINTS
+                    if leg == "left"
+                    else KinematicChain.RIGHT_JOINTS
+                )
+                logical_angles = [
+                    a - robot._default_offsets.get(n, 0.0)
+                    for a, n in zip(result.angles_deg, names)
+                ]
                 await ws.send_text(json.dumps({
                     "type": "ik_result",
                     "leg": leg,
                     "success": result.success,
-                    "angles_deg": result.angles_deg,
+                    "angles_deg": logical_angles,
                     "position_error_m": result.position_error_m,
                     "message": result.message,
                 }))
 
             elif msg_type == "set_joints_fk":
+                # Incoming angles are logical space (0 = default standing).
+                # Convert to URDF before writing and before FK computation.
                 leg = msg["leg"]
-                angles = msg["angles_deg"]
-                from robot.kinematics.chain import KinematicChain
-                names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
-                joint_angles = dict(zip(names, angles))
-                robot.sync_write_positions(joint_angles)
-                fk = robot.compute_fk(leg, angles)
+                logical_angles = msg["angles_deg"]
+                names = (
+                    KinematicChain.LEFT_JOINTS
+                    if leg == "left"
+                    else KinematicChain.RIGHT_JOINTS
+                )
+                urdf_angles = [
+                    a + robot._default_offsets.get(n, 0.0)
+                    for a, n in zip(logical_angles, names)
+                ]
+                robot.sync_write_positions(dict(zip(names, urdf_angles)), raw=True)
+                fk = robot.compute_fk(leg, urdf_angles)
                 await ws.send_text(json.dumps({
                     "type": "fk_result",
                     "leg": leg,
