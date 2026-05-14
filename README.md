@@ -36,21 +36,29 @@ BipedRobotJetson/
 ├── config/
 │   ├── hardware.yaml             # UART port, baud rate, I2C bus/address, timeouts
 │   └── robot.yaml                # Servo IDs, zero offsets, PIDs, default poses
-├── robot/
-│   ├── config.py                 # Pydantic Settings — loads .env + both YAMLs
-│   ├── hardware/
-│   │   ├── serial_bus.py         # Thread-safe half-duplex UART (echo drain)
-│   │   ├── st3215/
-│   │   │   ├── registers.py      # Full ST3215 register + instruction map
-│   │   │   ├── protocol.py       # SCS packet encode/decode, checksum, SYNC_WRITE
-│   │   │   └── servo.py          # ST3215 driver: position, torque, PID, status
-│   │   └── imu/
-│   │       └── bno085.py         # BNO085 wrapper (quat → Euler, calibration)
-│   ├── kinematics/
-│   │   ├── chain.py              # URDF parser → kinematic chain, FK
-│   │   └── solver.py             # FK + numerical IK (scipy SLSQP)
-│   └── robot.py                  # Orchestrator: motion, IK, telemetry loop
-├── web/
+│
+├── hardware/                     # Standalone servo bus + IMU library (no web/robot deps)
+│   ├── README.md                 # Library documentation + usage examples
+│   ├── config.py                 # PIDConfig, ServoConfig, HardwareConfig (Pydantic)
+│   ├── serial_bus.py             # Thread-safe half-duplex UART (echo drain)
+│   ├── servo_bus_manager.py      # 50 Hz SYNC_READ/WRITE bus thread
+│   ├── st3215/
+│   │   ├── registers.py          # Full ST3215 register + instruction map
+│   │   ├── protocol.py           # SCS packet encode/decode, checksum, SYNC_WRITE
+│   │   └── servo.py              # ST3215 driver: position, torque, PID, status
+│   └── imu/
+│       └── bno085.py             # BNO085 wrapper (quat → Euler, calibration)
+│
+├── kinematics/                   # Standalone FK/IK library (no web/robot/hardware deps)
+│   ├── README.md                 # Library documentation + usage examples
+│   ├── chain.py                  # URDF parser → kinematic chain, FK (Rodrigues)
+│   └── solver.py                 # FK + numerical IK (scipy SLSQP + L-BFGS-B fallback)
+│
+├── robot/                        # Robot orchestrator (uses hardware/ and kinematics/)
+│   ├── config.py                 # RobotConfig + Settings — loads .env + both YAMLs
+│   └── robot.py                  # Robot class: motion, IK, telemetry loop
+│
+├── web/                          # Debug web UI (uses robot/ only)
 │   ├── app.py                    # FastAPI factory, lifespan, static mounts
 │   ├── routers/
 │   │   ├── servos.py             # REST /api/servos/*
@@ -65,12 +73,24 @@ BipedRobotJetson/
 │           ├── servos.js         # Servo tab
 │           ├── imu.js            # IMU tab
 │           └── robot3d.js        # Three.js viewer, IK/FK sliders, pose buttons
+│
 ├── RobotDescription/
 │   ├── urdf/Robot.urdf           # Robot URDF (source)
 │   └── meshes/*.stl              # Visual/collision meshes
 ├── main.py                       # Entry point
 └── requirements.txt
 ```
+
+### Dependency Layers
+
+```
+hardware/    ←  no project imports (standalone)
+kinematics/  ←  no project imports (standalone)
+robot/       ←  imports from hardware/ and kinematics/
+web/         ←  imports from robot/ only
+```
+
+`hardware/` and `kinematics/` can be copied into any future project and used independently.
 
 ---
 

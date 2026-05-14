@@ -17,6 +17,19 @@ No build step. Three.js and urdf-loader load from CDN at runtime. `workers=1` is
 pip3 install -r requirements-hardware.txt   # adafruit-blinka + bno08x
 ```
 
+## Repository Structure & Dependency Layers
+
+```
+hardware/    ← standalone servo bus + IMU library (no project imports)
+kinematics/  ← standalone FK/IK library (no project imports)
+robot/       ← orchestrator (imports hardware/ and kinematics/)
+web/         ← debug UI (imports robot/ only)
+```
+
+`hardware/` and `kinematics/` have their own `README.md` files with usage examples. They can be used without the robot orchestrator.
+
+**Import rule:** Never add imports that go against the dependency arrows. `web/` must not import from `hardware/` or `kinematics/` directly — always go through `robot/robot.py`'s public API.
+
 ## Configuration
 
 Two config layers, merged at startup by `robot/config.py:Settings.load()`:
@@ -26,7 +39,7 @@ Two config layers, merged at startup by `robot/config.py:Settings.load()`:
 - `config/robot.yaml` — servo IDs, `zero_offset_steps`, `direction_sign`, `default_position_deg`, PID gains, named poses
 
 **`zero_offset_steps`**: raw encoder value (0–4095) when the joint is at 0° in URDF space.  
-**`direction_sign`**: ±1 — maps physical servo rotation to URDF joint convention.  
+**`direction_sign`**: ±1 — maps physical servo rotation to URDF joint convention. Validated at load time: must be exactly -1 or 1.  
 **`default_position_deg`**: the robot's calibrated standing angle for that joint; defines logical zero (see coordinate spaces below).
 
 Named poses under `poses:` are in **logical space** (0 = default standing position). The `home_pose` key points to which pose the Home button executes.
@@ -46,9 +59,11 @@ Conversion: `logical = urdf − default_position_deg`
 
 `Robot.sync_write_positions(angles, raw=False)` applies the offset (logical → URDF) unless `raw=True`. The telemetry frame exposes both `position_deg` (URDF, for the 3D model) and `logical_deg` (for sliders).
 
+Use `robot.urdf_to_logical(leg, angles)` and `robot.logical_to_urdf(leg, angles)` for conversions in `web/` — never access `robot._default_offsets` directly.
+
 ### Bus Manager (50 Hz loop)
 
-`robot/hardware/servo_bus_manager.py:ServoBusManager` owns the serial bus exclusively in a daemon thread. Every cycle (~20 ms):
+`hardware/servo_bus_manager.py:ServoBusManager` owns the serial bus exclusively in a daemon thread. Every cycle (~20 ms):
 
 1. **SYNC_READ** (SCS instruction `0x82`) — one broadcast packet, 12 sequential responses; all servo states updated atomically
 2. Read IMU
@@ -85,16 +100,18 @@ Telemetry (20 Hz, separate thread)
 
 | File | Role |
 |------|------|
-| `robot/hardware/servo_bus_manager.py` | 50 Hz bus thread, SYNC_READ/SYNC_WRITE, state cache |
-| `robot/hardware/serial_bus.py` | Thread-safe half-duplex UART; `transfer()`, `sync_read()`, `send_no_reply()` |
-| `robot/hardware/st3215/protocol.py` | SCS packet encoding: `encode_sync_read`, `encode_sync_write`, checksum |
-| `robot/hardware/st3215/registers.py` | Full ST3215 register + instruction map (`Reg`, `Instr`) |
-| `robot/hardware/st3215/servo.py` | Per-servo driver: `deg_to_steps`, `steps_to_deg`, `get_status` |
+| `hardware/servo_bus_manager.py` | 50 Hz bus thread, SYNC_READ/SYNC_WRITE, state cache |
+| `hardware/serial_bus.py` | Thread-safe half-duplex UART; `transfer()`, `sync_read()`, `send_no_reply()` |
+| `hardware/st3215/protocol.py` | SCS packet encoding: `encode_sync_read`, `encode_sync_write`, checksum |
+| `hardware/st3215/registers.py` | Full ST3215 register + instruction map (`Reg`, `Instr`) |
+| `hardware/st3215/servo.py` | Per-servo driver: `deg_to_steps`, `steps_to_deg`, `get_status` |
+| `hardware/imu/bno085.py` | BNO085 IMU driver: quaternion → Euler, calibration |
+| `hardware/config.py` | `PIDConfig`, `ServoConfig`, `HardwareConfig` (Pydantic) |
+| `kinematics/chain.py` | URDF parser → 6-joint kinematic chain, FK via Rodrigues transforms |
+| `kinematics/solver.py` | `fk()` and `ik()` (scipy SLSQP, warm-start from current angles) |
 | `robot/robot.py` | Orchestrator: offset layer, motion commands, telemetry loop |
-| `robot/kinematics/chain.py` | URDF parser → 6-joint kinematic chain, FK via Rodrigues transforms |
-| `robot/kinematics/solver.py` | `fk()` and `ik()` (scipy SLSQP, warm-start from current angles) |
 | `robot/config.py` | Pydantic `Settings` — merges `.env` + both YAMLs |
-| `web/websocket.py` | WS dispatcher: IK in executor, logical↔URDF conversions, `raw` flag routing |
+| `web/websocket.py` | WS dispatcher: IK in executor, uses `robot.urdf_to_logical()` / `robot.logical_to_urdf()` |
 | `web/app.py` | FastAPI factory, lifespan (starts telemetry, mounts routes) |
 
 ### Half-duplex UART protocol notes
@@ -106,7 +123,7 @@ Checksum: `~(ID + LEN + INSTR + sum(PARAMS)) & 0xFF`
 
 ### IK
 
-IK is numerical (scipy SLSQP), not analytical — the hip offset geometry prevents closed-form solution. Always warm-started from current URDF-space joint angles. Falls back to L-BFGS-B on failure. Returns angles in URDF space; `websocket.py` converts to logical before sending to the UI.
+IK is numerical (scipy SLSQP), not analytical — the hip offset geometry prevents closed-form solution. Always warm-started from current URDF-space joint angles. Falls back to L-BFGS-B on failure. Returns angles in URDF space; `websocket.py` converts to logical before sending to the UI via `robot.urdf_to_logical()`.
 
 ## Adding a new pose
 
@@ -125,3 +142,5 @@ bus_manager.set_target_positions(policy_output_urdf, speed=0)  # non-blocking
 ```
 
 Policy inputs/outputs should be in URDF space. `default_position_deg` can be used to normalise inputs (subtract) and denormalise outputs (add) at the policy boundary.
+
+Or use the standalone `kinematics/` library directly alongside your own hardware access — it has no dependencies on `robot/` or `web/`.

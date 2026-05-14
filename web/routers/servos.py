@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 import yaml
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from robot.hardware.serial_bus import SerialBusError
-from robot.hardware.st3215.servo import ServoStatus
+from robot import SerialBusError, ServoStatus
 
 router = APIRouter()
 
@@ -74,8 +75,8 @@ def scan_servos(request: Request, start: int = 0, end: int = 253) -> list[dict]:
 
     result = []
     for servo_id in ids:
-        servo = robot._servos_by_id.get(servo_id)
-        result.append({"id": servo_id, "joint": servo.joint_name if servo else None})
+        info = robot.get_servo_id_info(servo_id)
+        result.append({"id": servo_id, "joint": info["joint"] if info else None})
     return result
 
 
@@ -101,8 +102,8 @@ def get_servo_raw(servo_id: int, request: Request) -> dict:
             "id": servo_id,
             "raw_steps": steps,
             "raw_deg": round(servo.steps_to_deg_raw(steps), 2),
-            "zero_offset_steps": servo._cfg.zero_offset_steps,
-            "direction_sign": servo._cfg.direction_sign,
+            "zero_offset_steps": servo.zero_offset_steps,
+            "direction_sign": servo.direction_sign,
         }
     except KeyError:
         raise HTTPException(404, f"Servo {servo_id} not found")
@@ -171,7 +172,7 @@ def set_zero(servo_id: int, request: Request):
     try:
         servo = robot.get_servo_any(servo_id)
         servo.set_zero_here()
-        return {"ok": True, "servo_id": servo_id, "zero_steps": servo._cfg.zero_offset_steps}
+        return {"ok": True, "servo_id": servo_id, "zero_steps": servo.zero_offset_steps}
     except KeyError:
         raise HTTPException(404, f"Servo {servo_id} not found")
     except SerialBusError as exc:
@@ -245,8 +246,8 @@ def set_zero_offset(servo_id: int, request: Request):
     if not _update_robot_yaml(servo_id, steps):
         raise HTTPException(404, f"Servo {servo_id} not found in config")
 
-    servo._cfg.zero_offset_steps = steps
-    servo._cfg.default_position_deg = 0.0
+    servo.zero_offset_steps = steps
+    servo.default_position_deg = 0.0
     return {"ok": True, "servo_id": servo_id, "zero_offset_steps": steps}
 
 
@@ -277,7 +278,7 @@ def _status_dict(s: ServoStatus) -> dict:
 
 
 def _update_robot_yaml(servo_id: int, zero_offset_steps: int) -> bool:
-    path = Path("config/robot.yaml")
+    path = Path(__file__).parents[2] / "config" / "robot.yaml"
     if not path.exists():
         return False
     data = yaml.safe_load(path.read_text()) or {}
@@ -291,5 +292,18 @@ def _update_robot_yaml(servo_id: int, zero_offset_steps: int) -> bool:
             break
     if not updated:
         return False
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+    # Atomic write: write to a temp file then rename so a crash cannot
+    # leave a partially-written config.
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(yaml.safe_dump(data, sort_keys=False))
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return True

@@ -23,5 +23,5 @@ def get_imu(request: Request) -> dict:
 
 @router.post("/calibrate")
 def calibrate(request: Request):
-    _robot(request)._imu.calibrate()
+    _robot(request).calibrate_imu()
     return {"ok": True, "message": "Dynamic calibration started"}

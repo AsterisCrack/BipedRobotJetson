@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
@@ -47,9 +46,11 @@ def forward_kinematics_from_angles(leg: str, cmd: FKCmd, request: Request) -> di
 def inverse_kinematics(leg: str, cmd: IKCmd, request: Request) -> dict:
     _validate_leg(leg)
     robot = _robot(request)
-    result = robot.set_foot_position(leg, cmd.x, cmd.y, cmd.z) if cmd.execute \
-        else robot._solver.ik(leg, np.array([cmd.x, cmd.y, cmd.z]),
-                               initial_angles_deg=robot.get_current_joint_angles_deg(leg))
+    result = (
+        robot.set_foot_position(leg, cmd.x, cmd.y, cmd.z)
+        if cmd.execute
+        else robot.compute_ik(leg, cmd.x, cmd.y, cmd.z)
+    )
     return {
         "success": result.success,
         "angles_deg": result.angles_deg,
@@ -60,7 +61,7 @@ def inverse_kinematics(leg: str, cmd: IKCmd, request: Request) -> dict:
 
 @router.get("/poses")
 def list_poses(request: Request) -> list[str]:
-    return list(_robot(request)._settings.robot.poses.keys())
+    return _robot(request).list_pose_names()
 
 
 @router.post("/poses/{name}")
@@ -76,8 +77,8 @@ def execute_pose(name: str, request: Request):
 @router.post("/home")
 def go_home(request: Request):
     robot = _robot(request)
-    robot.go_to_pose(robot._settings.robot.home_pose)
-    return {"ok": True, "pose": robot._settings.robot.home_pose}
+    robot.go_to_pose(robot.home_pose_name())
+    return {"ok": True, "pose": robot.home_pose_name()}
 
 
 # ------------------------------------------------------------------

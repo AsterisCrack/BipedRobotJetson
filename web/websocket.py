@@ -4,10 +4,7 @@ import asyncio
 import json
 import logging
 
-import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
-
-from robot.kinematics.chain import KinematicChain
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +39,8 @@ class TelemetryBroadcaster:
             for ws in list(self._connections):
                 try:
                     await ws.send_text(json.dumps(frame))
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Broadcast error, dropping client: %s", exc)
                     dead.add(ws)
             self._connections -= dead
 
@@ -102,15 +100,7 @@ class TelemetryBroadcaster:
                     None, robot.set_foot_position, leg, x, y, z
                 )
                 # result.angles_deg is URDF space; convert to logical for UI.
-                names = (
-                    KinematicChain.LEFT_JOINTS
-                    if leg == "left"
-                    else KinematicChain.RIGHT_JOINTS
-                )
-                logical_angles = [
-                    a - robot._default_offsets.get(n, 0.0)
-                    for a, n in zip(result.angles_deg, names)
-                ]
+                logical_angles = robot.urdf_to_logical(leg, result.angles_deg)
                 await ws.send_text(json.dumps({
                     "type": "ik_result",
                     "leg": leg,
@@ -125,15 +115,8 @@ class TelemetryBroadcaster:
                 # Convert to URDF before writing and before FK computation.
                 leg = msg["leg"]
                 logical_angles = msg["angles_deg"]
-                names = (
-                    KinematicChain.LEFT_JOINTS
-                    if leg == "left"
-                    else KinematicChain.RIGHT_JOINTS
-                )
-                urdf_angles = [
-                    a + robot._default_offsets.get(n, 0.0)
-                    for a, n in zip(logical_angles, names)
-                ]
+                names = robot.leg_joint_names(leg)
+                urdf_angles = robot.logical_to_urdf(leg, logical_angles)
                 robot.sync_write_positions(dict(zip(names, urdf_angles)), raw=True)
                 fk = robot.compute_fk(leg, urdf_angles)
                 await ws.send_text(json.dumps({

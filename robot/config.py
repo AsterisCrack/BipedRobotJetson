@@ -7,29 +7,7 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
-class PIDConfig(BaseModel):
-    p: int = 32
-    d: int = 16
-    i: int = 0
-
-
-class ServoConfig(BaseModel):
-    servo_id: int
-    joint_name: str
-    direction_sign: int = 1
-    zero_offset_steps: int = 2048
-    default_position_deg: float = 0.0
-    pid: PIDConfig = Field(default_factory=PIDConfig)
-
-
-class HardwareConfig(BaseModel):
-    uart_port: str = "/dev/ttyTHS1"
-    baud_rate: int = 1_000_000
-    i2c_bus: int = 7
-    i2c_address: int = 0x4A
-    uart_timeout_s: float = 0.05
-    max_retries: int = 3
+from hardware.config import HardwareConfig, PIDConfig, ServoConfig  # noqa: F401 (re-exported)
 
 
 class RobotConfig(BaseModel):
@@ -88,4 +66,7 @@ def _read_yaml(path: str) -> dict[str, Any]:
     if not p.exists():
         return {}
     with p.open() as f:
-        return yaml.safe_load(f) or {}
+        try:
+            return yaml.safe_load(f) or {}
+        except yaml.YAMLError as exc:
+            raise yaml.YAMLError(f"Failed to parse YAML at {p}: {exc}") from exc

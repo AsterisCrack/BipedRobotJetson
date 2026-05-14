@@ -7,14 +7,15 @@ import time
 
 import numpy as np
 
-from robot.config import ServoConfig, Settings
-from robot.hardware.imu.bno085 import BNO085, IMUReading
-from robot.hardware.serial_bus import SerialBus, SerialBusError
-from robot.hardware.servo_bus_manager import ServoBusManager
-from robot.hardware.st3215.protocol import encode_ping
-from robot.hardware.st3215.servo import ST3215, ServoStatus
-from robot.kinematics.chain import KinematicChain
-from robot.kinematics.solver import IKResult, KinematicSolver
+from hardware.config import ServoConfig
+from hardware.imu.bno085 import BNO085, IMUReading
+from hardware.serial_bus import SerialBus, SerialBusError
+from hardware.servo_bus_manager import ServoBusManager
+from hardware.st3215.protocol import encode_ping
+from hardware.st3215.servo import ST3215, ServoStatus
+from kinematics.chain import KinematicChain
+from kinematics.solver import IKResult, KinematicSolver
+from robot.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,11 @@ class Robot:
         self._servos_by_id[servo_id] = servo
         return servo
 
+    def get_servo_id_info(self, servo_id: int) -> dict | None:
+        """Return {'id': ..., 'joint': ...} for a known servo ID, or None."""
+        servo = self._servos_by_id.get(servo_id)
+        return {"id": servo_id, "joint": servo.joint_name} if servo else None
+
     def update_servo_id(self, old_id: int, new_id: int) -> None:
         if old_id in self._servos_by_id:
             servo = self._servos_by_id.pop(old_id)
@@ -249,10 +255,25 @@ class Robot:
             names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
             # result.angles_deg is in URDF space; send raw=True
             self.sync_write_positions(dict(zip(names, result.angles_deg)), raw=True)
+        else:
+            logger.warning(
+                "IK failed for leg=%s target=[%.4f, %.4f, %.4f] error=%.6fm msg=%r",
+                leg, x, y, z, result.position_error_m, result.message,
+            )
         return result
+
+    def compute_ik(self, leg: str, x: float, y: float, z: float) -> IKResult:
+        """Run IK without executing motion. Returns IKResult in URDF space."""
+        current = self._get_current_urdf_angles(leg)
+        return self._solver.ik(
+            leg, target_pos=np.array([x, y, z]), initial_angles_deg=current
+        )
 
     def get_foot_position(self, leg: str) -> dict:
         return self._solver.fk(leg, self._get_current_urdf_angles(leg))
+
+    def compute_fk(self, leg: str, angles_deg: list[float]) -> dict:
+        return self._solver.fk(leg, angles_deg)
 
     def _get_current_urdf_angles(self, leg: str) -> list[float]:
         """Return current joint angles in URDF space from bus manager cache."""
@@ -267,8 +288,45 @@ class Robot:
         """Kept for backwards compatibility — returns URDF angles."""
         return self._get_current_urdf_angles(leg)
 
-    def compute_fk(self, leg: str, angles_deg: list[float]) -> dict:
-        return self._solver.fk(leg, angles_deg)
+    # ------------------------------------------------------------------
+    # Coordinate space helpers (public — for web layer)
+    # ------------------------------------------------------------------
+
+    def urdf_to_logical(self, leg: str, urdf_angles: list[float]) -> list[float]:
+        """Convert URDF-space angles to logical space for the given leg."""
+        names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
+        return [
+            a - self._default_offsets.get(n, 0.0)
+            for a, n in zip(urdf_angles, names)
+        ]
+
+    def logical_to_urdf(self, leg: str, logical_angles: list[float]) -> list[float]:
+        """Convert logical-space angles to URDF space for the given leg."""
+        names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
+        return [
+            a + self._default_offsets.get(n, 0.0)
+            for a, n in zip(logical_angles, names)
+        ]
+
+    def leg_joint_names(self, leg: str) -> list[str]:
+        """Return the ordered list of joint names for the given leg."""
+        return KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
+
+    # ------------------------------------------------------------------
+    # Config helpers (public — for web layer)
+    # ------------------------------------------------------------------
+
+    def list_pose_names(self) -> list[str]:
+        """Return names of all configured poses."""
+        return list(self._settings.robot.poses.keys())
+
+    def home_pose_name(self) -> str:
+        """Return the name of the home pose."""
+        return self._settings.robot.home_pose
+
+    def calibrate_imu(self) -> None:
+        """Start dynamic IMU calibration."""
+        self._imu.calibrate()
 
     # ------------------------------------------------------------------
     # Status reads (non-blocking — reads from bus manager cache)
@@ -360,8 +418,16 @@ class Robot:
                     "calibration": imu.calibration_status,
                 },
                 "kinematics": {
-                    "left_foot":  {"x": left_foot["position"][0],  "y": left_foot["position"][1],  "z": left_foot["position"][2]},
-                    "right_foot": {"x": right_foot["position"][0], "y": right_foot["position"][1], "z": right_foot["position"][2]},
+                    "left_foot": {
+                        "x": round(left_foot["position"][0], 4),
+                        "y": round(left_foot["position"][1], 4),
+                        "z": round(left_foot["position"][2], 4),
+                    },
+                    "right_foot": {
+                        "x": round(right_foot["position"][0], 4),
+                        "y": round(right_foot["position"][1], 4),
+                        "z": round(right_foot["position"][2], 4),
+                    },
                 },
             }
 
