@@ -21,13 +21,13 @@ class SerialBus:
     before reading the servo's response packet.
     """
 
-    def __init__(self, port: str, baud_rate: int, timeout: float = 0.05) -> None:
+    def __init__(self, port: str, baud_rate: int, timeout: float = 0.05, expect_echo: bool = False) -> None:
         self._port = port
         self._baud_rate = baud_rate
         self._timeout = timeout
         self._serial: serial.Serial | None = None
         self._lock = threading.Lock()
-        self._expect_echo = True
+        self._expect_echo = expect_echo
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -124,12 +124,17 @@ class SerialBus:
         if not self.is_open:
             raise SerialBusError("Serial bus is not open")
 
+        stride = 6 + data_len              # bytes per servo response
+        total_rx = stride * len(servo_ids)
+
         results: dict[int, bytes] = {}
         with self._lock:
-            self._serial.reset_input_buffer()
             self._serial.write(packet)
-            self._serial.flush()
-
+            # No flush() — the hardware UART starts DMA immediately after write().
+            # flush() (tcdrain) on the Jetson L4T kernel waits one full kernel tick
+            # (~10 ms) regardless of packet size, adding 10 ms of dead time per cycle.
+            # The servo responses arrive during that wait and pile up in the RX buffer;
+            # skipping flush() and going straight to read() cuts ~10 ms per cycle.
             if self._expect_echo:
                 echo = self._serial.read(len(packet))
                 if len(echo) == 0:
@@ -143,12 +148,23 @@ class SerialBus:
                         f"expected {len(packet)} bytes, got {len(echo)}"
                     )
 
-            for sid in servo_ids:
+            # One bulk read instead of N individual reads — eliminates N-1 syscalls.
+            bulk = self._serial.read(total_rx)
+            if len(bulk) < total_rx:
+                logger.debug(
+                    "SYNC_READ bulk: short read — expected %d bytes, got %d; "
+                    "clearing input buffer",
+                    total_rx, len(bulk),
+                )
+                self._serial.reset_input_buffer()
+                return results
+
+            for i, sid in enumerate(servo_ids):
+                chunk = bulk[i * stride : (i + 1) * stride]
                 try:
-                    data = self._read_response(data_len)
-                    results[sid] = data
+                    results[sid] = self._parse_chunk(chunk, data_len)
                 except SerialBusError as exc:
-                    logger.debug("SYNC_READ: no response from servo %d: %s", sid, exc)
+                    logger.debug("SYNC_READ: bad response from servo %d: %s", sid, exc)
 
         return results
 
@@ -158,9 +174,8 @@ class SerialBus:
             raise SerialBusError("Serial bus is not open")
 
         with self._lock:
-            self._serial.reset_input_buffer()
             self._serial.write(packet)
-            self._serial.flush()
+            # No flush() — bytes transmit via DMA while the bus manager sleeps.
             # Drain echo only — no response packet expected
             if self._expect_echo:
                 echo = self._serial.read(len(packet))
@@ -179,14 +194,18 @@ class SerialBus:
             raise SerialBusError(
                 f"Response timeout: expected {total} bytes, got {len(raw)}"
             )
-        if raw[0] != 0xFF or raw[1] != 0xFF:
-            raise SerialBusError(f"Bad response header: {raw[:2].hex()}")
+        return self._parse_chunk(raw, data_len)
 
-        servo_id = raw[2]
-        length = raw[3]   # LEN field = ERR + DATA + CHECKSUM = data_len + 2
-        error = raw[4]
-        data = raw[5 : 5 + data_len]
-        checksum = raw[5 + data_len]
+    def _parse_chunk(self, chunk: bytes, data_len: int) -> bytes:
+        """Validate and extract data from one servo response chunk (no I/O)."""
+        if chunk[0] != 0xFF or chunk[1] != 0xFF:
+            raise SerialBusError(f"Bad response header: {chunk[:2].hex()}")
+
+        servo_id = chunk[2]
+        length   = chunk[3]   # ERR + DATA + CHECKSUM = data_len + 2
+        error    = chunk[4]
+        data     = chunk[5 : 5 + data_len]
+        checksum = chunk[5 + data_len]
 
         expected_chk = (~(servo_id + length + error + sum(data))) & 0xFF
         if checksum != expected_chk:

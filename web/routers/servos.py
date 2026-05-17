@@ -49,6 +49,12 @@ class PIDCmd(BaseModel):
 class IDCmd(BaseModel):
     new_id: int
 
+class DirectionSignCmd(BaseModel):
+    direction_sign: int
+
+class DefaultPositionCmd(BaseModel):
+    default_position_deg: float
+
 class SyncPositionsCmd(BaseModel):
     joints: dict[str, float]   # {joint_name: degrees}
     speed: int = 300
@@ -57,6 +63,18 @@ class SyncPositionsCmd(BaseModel):
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
+
+@router.get("/simulation")
+def get_simulation_mode(request: Request) -> dict:
+    return {"enabled": _robot(request).simulation_mode}
+
+
+@router.post("/simulation")
+def set_simulation_mode(request: Request, body: dict) -> dict:
+    enabled = bool(body.get("enabled", False))
+    _robot(request).set_simulation_mode(enabled)
+    return {"enabled": enabled}
+
 
 @router.get("/")
 def list_servos(request: Request) -> list[dict]:
@@ -249,6 +267,31 @@ def set_zero_offset(servo_id: int, request: Request):
     servo.zero_offset_steps = steps
     servo.default_position_deg = 0.0
     return {"ok": True, "servo_id": servo_id, "zero_offset_steps": steps}
+
+
+@router.post("/{servo_id}/direction_sign")
+def update_direction_sign(servo_id: int, cmd: DirectionSignCmd, request: Request):
+    if cmd.direction_sign not in (-1, 1):
+        raise HTTPException(400, "direction_sign must be -1 or 1")
+    robot = _robot(request)
+    try:
+        servo = robot.get_servo_any(servo_id)
+        servo.direction_sign = cmd.direction_sign
+    except KeyError:
+        raise HTTPException(404, f"Servo {servo_id} not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "servo_id": servo_id, "direction_sign": cmd.direction_sign}
+
+
+@router.post("/{servo_id}/default_position")
+def update_default_position(servo_id: int, cmd: DefaultPositionCmd, request: Request):
+    robot = _robot(request)
+    try:
+        robot.set_servo_default_position(servo_id, cmd.default_position_deg)
+    except KeyError:
+        raise HTTPException(404, f"Servo {servo_id} not found")
+    return {"ok": True, "servo_id": servo_id, "default_position_deg": cmd.default_position_deg}
 
 
 @router.post("/sync_positions")

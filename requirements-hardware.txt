@@ -1,2 +1,2 @@
+Jetson.GPIO
 adafruit-blinka
-adafruit-circuitpython-bno08x

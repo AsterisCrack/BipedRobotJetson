@@ -79,6 +79,70 @@ class KinematicChain:
             T = T @ _joint_transform(joint, angle)
         return T
 
+    def fk_all(self, leg: str, angles_rad: list[float]) -> list[np.ndarray]:
+        """
+        Returns N+1 cumulative transforms: [I, T_0, T_01, ..., T_0..N-1].
+        T[i] is the world-frame pose of joint i's origin (before joint i rotates).
+        T[N] is the end-effector transform.
+        """
+        chain = self.get_chain(leg)
+        transforms = [np.eye(4)]
+        T = np.eye(4)
+        for joint, angle in zip(chain, angles_rad):
+            T = T @ _joint_transform(joint, angle)
+            transforms.append(T.copy())
+        return transforms
+
+    def full_jacobian(
+        self, leg: str, angles_rad: list[float]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns (J_pos, J_omega, T_end) in a single chain walk.
+
+        J_pos[3×N]  — position Jacobian: J_pos[:,i] = z_i × (p_e − p_i)
+        J_omega[3×N]— angular Jacobian:  J_omega[:,i] = z_i
+        T_end[4×4]  — end-effector homogeneous transform
+        """
+        chain = self.get_chain(leg)
+        transforms = self.fk_all(leg, angles_rad)
+        T_end = transforms[-1]
+        p_e = T_end[:3, 3]
+
+        J_pos   = np.zeros((3, len(chain)))
+        J_omega = np.zeros((3, len(chain)))
+        for i, joint in enumerate(chain):
+            z_i = transforms[i][:3, :3] @ joint.axis
+            p_i = transforms[i + 1][:3, 3]
+            J_pos[:, i]   = np.cross(z_i, p_e - p_i)
+            J_omega[:, i] = z_i
+        return J_pos, J_omega, T_end
+
+    def position_jacobian(self, leg: str, angles_rad: list[float]) -> np.ndarray:
+        """
+        Returns the 3×N position Jacobian via the geometric formula:
+            J[:, i] = z_i × (p_e − p_i)
+        where z_i is joint i's axis in the world frame and p_i is its origin.
+        """
+        chain = self.get_chain(leg)
+        transforms = self.fk_all(leg, angles_rad)
+        p_e = transforms[-1][:3, 3]
+
+        J = np.zeros((3, len(chain)))
+        # transforms[i]   = cumulative world-frame transform UP TO (not including) joint i
+        #                    → transforms[i][:3,:3] is the parent-frame orientation in world
+        #                    → transforms[i][:3, 3] is the parent-link origin in world
+        # transforms[i+1] = cumulative transform AFTER joint i
+        #                    → transforms[i+1][:3, 3] = joint i's attachment point in world
+        #                      (the child-link origin, independent of joint i's angle)
+        # Geometric Jacobian: J[:,i] = z_i × (p_e − p_i)
+        # where z_i  = joint axis in world frame
+        #       p_i  = any point on the rotation axis (use child-link origin)
+        for i, joint in enumerate(chain):
+            z_i = transforms[i][:3, :3] @ joint.axis
+            p_i = transforms[i + 1][:3, 3]
+            J[:, i] = np.cross(z_i, p_e - p_i)
+        return J
+
     def joint_limits(self, leg: str) -> list[tuple[float, float]]:
         return [(j.lower, j.upper) for j in self.get_chain(leg)]
 

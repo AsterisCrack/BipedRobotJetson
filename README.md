@@ -10,7 +10,7 @@ Standalone Python control stack for a 12-DOF biped robot running on a **Jetson O
 |-----------|---------|
 | Computer | NVIDIA Jetson Orin Nano |
 | Servos | 12× ST3215 smart servos (SCS/Feetech protocol, half-duplex UART) |
-| IMU | BNO085 (I2C, Adafruit library) |
+| IMU | BNO055 (I2C, register-mapped, addr 0x28) |
 | Legs | 2× 6-DOF (hip yaw/roll/pitch · knee · ankle roll/pitch) |
 
 ---
@@ -20,7 +20,7 @@ Standalone Python control stack for a 12-DOF biped robot running on a **Jetson O
 - **Servo control** — real-time position, speed, load, voltage, temperature monitoring; per-servo position sliders; torque enable/disable; PID tuning; ID reassignment; zero-point calibration
 - **IMU readouts** — quaternion, Euler angles (roll/pitch/yaw), accelerometer, gyroscope, calibration status, artificial horizon display
 - **Forward kinematics** — computes foot position from current joint angles using transforms extracted directly from the URDF
-- **Inverse kinematics** — numerical IK (scipy SLSQP) from a target foot position to joint angles, with warm-start from current pose
+- **Inverse kinematics** — numerical IK (DLS — Damped Least Squares) from a target foot position to joint angles, with warm-start from current pose
 - **3D URDF viewer** — live Three.js visualisation of the robot model, updated from servo telemetry at 20 Hz
 - **Pose system** — named poses defined in YAML; one-click execution
 - **WebSocket telemetry** — unified 20 Hz frame to all connected browsers (servos + IMU + foot positions)
@@ -47,12 +47,12 @@ BipedRobotJetson/
 │   │   ├── protocol.py           # SCS packet encode/decode, checksum, SYNC_WRITE
 │   │   └── servo.py              # ST3215 driver: position, torque, PID, status
 │   └── imu/
-│       └── bno085.py             # BNO085 wrapper (quat → Euler, calibration)
+│       └── bno055.py             # BNO055 driver (quat → Euler, calibration)
 │
 ├── kinematics/                   # Standalone FK/IK library (no web/robot/hardware deps)
 │   ├── README.md                 # Library documentation + usage examples
 │   ├── chain.py                  # URDF parser → kinematic chain, FK (Rodrigues)
-│   └── solver.py                 # FK + numerical IK (scipy SLSQP + L-BFGS-B fallback)
+│   └── solver.py                 # FK + numerical IK (DLS — Damped Least Squares)
 │
 ├── robot/                        # Robot orchestrator (uses hardware/ and kinematics/)
 │   ├── config.py                 # RobotConfig + Settings — loads .env + both YAMLs
@@ -73,6 +73,10 @@ BipedRobotJetson/
 │           ├── servos.js         # Servo tab
 │           ├── imu.js            # IMU tab
 │           └── robot3d.js        # Three.js viewer, IK/FK sliders, pose buttons
+│
+├── tools/
+│   ├── bus_profiler.py           # Bus timing profiler (real ServoBusManager harness)
+│   └── return_delay.py           # Read/zero RETURN_DELAY register on all servos
 │
 ├── RobotDescription/
 │   ├── urdf/Robot.urdf           # Robot URDF (source)
@@ -116,18 +120,32 @@ pip3 install -r requirements-hardware.txt
 
 ### 3. Configure hardware paths
 
-Edit `.env` to match your Jetson's device nodes:
+Copy the example env file and edit it to match your Jetson's device nodes:
 
-```env
-UART_PORT=/dev/ttyTHS1   # or /dev/ttyUSB0 for USB adapter
-I2C_BUS=7                # 40-pin header I2C on Jetson Orin Nano
+```bash
+cp .env.example .env
 ```
 
-Verify with:
+All variables are optional — uncomment only what you need to change from the defaults:
+
+```env
+# Hardware paths
+UART_PORT=/dev/ttyTHS1   # or /dev/ttyUSB0 for USB-to-SCS adapter
+I2C_BUS=7                # 40-pin header I2C on Jetson Orin Nano
+
+# Bus tuning (see "Bus Performance" section below)
+BIPED_RT_SCHEDULING=1    # SCHED_FIFO for the servo bus thread (reduces jitter)
+BIPED_FAST_MODE=1        # Position-only reads — saves 720 µs per cycle
+
+# Debug
+BIPED_DEBUG=1            # DEBUG-level logs for kinematics/ and robot/
+```
+
+Verify hardware is visible:
 
 ```bash
 ls /dev/ttyTHS*          # hardware UART
-sudo i2cdetect -y 7      # BNO085 should appear at 0x4a
+sudo i2cdetect -y 7      # BNO055 should appear at 0x28
 ```
 
 ### 4. Run
@@ -148,7 +166,7 @@ Open `http://<jetson-ip>:8080` in any browser on the same network.
 uart_port: /dev/ttyTHS1
 baud_rate: 1000000        # ST3215 default: 1 Mbps
 i2c_bus: 7
-i2c_address: 0x4A         # BNO085 ADDR pin low → 0x4A, high → 0x4B
+i2c_address: 0x28         # BNO055 ADDR pin low → 0x28, high → 0x29
 uart_timeout_s: 0.05
 max_retries: 3
 ```
@@ -227,7 +245,7 @@ The **Enable All / Disable All** buttons control all 12 torques at once.
 - **Accelerometer** — X, Y, Z in m/s²
 - **Gyroscope** — X, Y, Z in rad/s
 - **Calibration dots** — 4 dots (red → green) showing sensor calibration quality (0–3)
-- **Calibrate button** — triggers dynamic calibration mode on the BNO085
+- **Calibrate button** — triggers dynamic calibration mode on the BNO055
 
 ### Robot Tab
 
@@ -378,14 +396,76 @@ Each `T_joint` = `T_origin × R(axis, θ)` using the Rodrigues rotation formula.
 
 ### Inverse Kinematics
 
-IK uses `scipy.optimize.minimize` with the SLSQP method (bounded, gradient-based). Analytical IK is not used because the hip joint offsets in this URDF prevent the hip pitch/roll axes from intersecting, which breaks standard closed-form humanoid IK.
+IK uses the **Damped Least Squares (DLS)** method. Analytical IK is not used because the hip joint offsets in this URDF prevent the hip pitch/roll axes from intersecting, which breaks standard closed-form humanoid IK.
 
 Key implementation details:
 - **Warm start** — always initialises from the current joint angles; avoids large jumps and converges to the physically correct branch (knee bending direction)
-- **Joint limits** — bounds extracted from the URDF, applied as scipy bounds constraints
-- **Cost function** — weighted sum of position error² + orientation error² (orientation weight 0.1, or disabled for position-only targets)
-- **Fallback** — if SLSQP fails to converge, retries with L-BFGS-B
-- **Typical performance** — 50–150 iterations, < 2 ms on Jetson
+- **Multi-start** — retries from the calibrated standing pose if the warm-start solution exceeds 5 mm error
+- **DLS step** — `dq = Jᵀ(JJᵀ + λ²I)⁻¹e`, λ²=0.01; robust near singular configurations
+- **Posture regularisation** — pulls solution toward warm-start to resolve redundancy
+- **Geometric Jacobian** — `J[:, i] = zᵢ × (p_e − pᵢ)`, computed analytically via `fk_all()`
+- **Typical performance** — under 200 iterations, < 5 ms on Jetson
+
+---
+
+## Bus Performance
+
+The servo bus runs at 50 Hz (20 ms/cycle). Each cycle: SYNC_READ all 12 servos → optionally SYNC_WRITE new targets → get IMU from parallel reader thread → sleep.
+
+**UART timing at 1 Mbps** (10 µs/byte):
+
+| Segment | Bytes | Time |
+|---------|-------|------|
+| SYNC_READ request | 20 | 200 µs |
+| 12 × servo response (8-byte status) | 168 | 1,680 µs |
+| SYNC_WRITE (12 servos) | 68 | 680 µs |
+| **Wire-only minimum** | | **~2.6 ms** |
+
+Measured on Jetson Orin Nano: UART ~2.9 ms, state fetch ~20 µs, spare ~16.9 ms mean (P5: ~16.6 ms). Zero true overruns with SCHED_FIFO.
+
+### Profiler
+
+`tools/bus_profiler.py` is a `ServoBusManager` harness — it runs the same code path as production (SCHED_FIFO, IMU reader thread, SYNC_READ/WRITE) and collects per-phase timing via built-in profiling hooks.
+
+```bash
+sudo venv/bin/python tools/bus_profiler.py              # 500 cycles, read-only
+sudo venv/bin/python tools/bus_profiler.py --cycles 1000 --write
+```
+
+Reports mean/std/min/max/P5/P95/P99 for: `t_uart_total`, `t_write_w` (if `--write`), `t_state_fetch`, `t_spare`, `t_cycle`. Also shows IMU reader thread I2C timing and two ASCII histograms (wide + jitter-zoomed). Run with `sudo` to apply SCHED_FIFO.
+
+### Return delay
+
+`tools/return_delay.py` reads and optionally zeros the `RETURN_DELAY` EEPROM register on all servos. Non-zero values add inter-servo gaps to each SYNC_READ cycle.
+
+```bash
+sudo venv/bin/python tools/return_delay.py              # read-only
+sudo venv/bin/python tools/return_delay.py --set-zero   # write 0 to all
+```
+
+### Optimizations
+
+Always active:
+
+| Optimization | Effect |
+|---|---|
+| **Parallel IMU** — dedicated `_IMUReaderThread` reads BNO055 over I2C continuously | removes 4 ms I2C latency from servo cycle |
+| **Batch RX** — one `read(168)` instead of 12 × `read(14)` | −550–1,100 µs/cycle |
+| **No flush()** — `tcdrain` removed from hot path (Jetson L4T adds ~10 ms/call) | −10 ms/cycle |
+| **Single BNO055 bulk read** — registers 0x14–0x2D in one 26-byte I2C transaction | −3 separate I2C calls |
+
+Opt-in via `.env`:
+
+**`BIPED_RT_SCHEDULING=1`** — applies `SCHED_FIFO` (Linux real-time scheduling, priority 10) to the servo bus thread. Eliminates 1–3 ms P99 spikes from OS preemption. Requires:
+
+```bash
+sudo setcap cap_sys_nice+eip $(readlink -f venv/bin/python3)
+# or: sudo venv/bin/python main.py
+```
+
+Note: `setcap` is silently ignored on `nosuid` filesystems (getcap will still show it; use `findmnt -T venv/bin/python3` to check). Running as root bypasses this.
+
+**`BIPED_FAST_MODE=1`** — SYNC_READ fetches only position (2 bytes/servo) instead of the full 8-byte status block. Saves 720 µs of pure UART time per cycle. Side effect: speed, load, voltage, and temperature read as 0 in telemetry.
 
 ---
 
@@ -423,9 +503,9 @@ New ST3215 servos ship with ID 1. To assign unique IDs:
 - Add your user to the `dialout` group: `sudo usermod -aG dialout $USER`
 
 **I2C:**
-- BNO085 on 40-pin header I2C: bus 7 (pin 3 = SDA, pin 5 = SCL)
-- Verify: `sudo i2cdetect -y 7` — BNO085 should appear at address `0x4a`
-- Adafruit Blinka auto-detects Jetson; no extra env vars needed for recent versions
+- BNO055 on 40-pin header I2C: bus 7 (pin 3 = SDA, pin 5 = SCL)
+- Verify: `sudo i2cdetect -y 7` — BNO055 should appear at address `0x28` (ADDR pin low)
+- Driver uses `Adafruit_PureIO.smbus` directly — no GPIO or Blinka HAL calls needed
 
 **Autostart (optional):**
 
@@ -477,76 +557,7 @@ python3 main.py
 | `uvicorn` | ASGI server |
 | `pydantic` + `pydantic-settings` | Config models and `.env` loading |
 | `pyyaml` | YAML config file parsing |
-| `adafruit-blinka` | CircuitPython HAL for Jetson *(hardware only)* |
-| `adafruit-circuitpython-bno08x` | BNO085 IMU driver *(hardware only)* |
+| `Jetson.GPIO` | Jetson GPIO HAL (required by adafruit-blinka for platform detection) *(hardware only)* |
+| `adafruit-blinka` | Provides `Adafruit_PureIO.smbus` for direct I2C register access *(hardware only)* |
 
 Three.js and urdf-loader are loaded from CDN at runtime — no npm or build step required.
-
-
-
-## ST3215 registers
-
-> Bytes are little-endian
-
-
-| Memory First Address   | Function                                       |   Number of Bytes |   Initial Value | Storage Area   | Permission   | Minimum Value   | Maximum Value   | Unit         | Value Parsing                                                                                                                                                                                                                                                                                                                                                                                   |
-|:-----------------------|:-----------------------------------------------|------------------:|----------------:|:---------------|:-------------|:----------------|:----------------|:-------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0x0                    | Firmware major version number                  |                 1 |               3 | EPROM          | read only    | -1              | -1              | nan          | nan                                                                                                                                                                                                                                                                                                                                                                                             |
-| 0x1                    | Firmware minor version number                  |                 1 |               7 | EPROM          | read only    | -1              | -1              | nan          | nan                                                                                                                                                                                                                                                                                                                                                                                             |
-| 0x3                    | Servo major version number                     |                 1 |               9 | EPROM          | read only    | -1              | -1              | nan          | nan                                                                                                                                                                                                                                                                                                                                                                                             |
-| 0x4                    | Servo minor version number                     |                 1 |               3 | EPROM          | read only    | -1              | -1              | nan          | nan                                                                                                                                                                                                                                                                                                                                                                                             |
-| 0x5                    | ID                                             |                 1 |               1 | EPROM          | read/write   | 0               | 253             | Baud         | A unique identification code on the bus, with no duplicate ID numbers allowed on the same bus. ID number 254 (0xFE) is the broadcast ID, and broadcasts do not receive response packets.                                                                                                                                                                                                        |
-| 0x6                    | Baudrate                                       |                 1 |               0 | EPROM          | read/write   | 0               | 7               | None         | 0-7 respectively represent baud rates as follows:                                                                                                                                                                                                                                                                                                                                               |
-|                        |                                                |                   |                 |                |              |                 |                 |              | 1000000, 500000, 250000, 128000, 115200, 76800, 57600, 38400                                                                                                                                                                                                                                                                                                                                    |
-| 0x7                    | Return delay                                   |                 1 |               0 | EPROM          | read/write   | 0               | 254             | 2us          | The minimum unit is 2us, and the maximum allowable setting for response delay is 254*2=508us                                                                                                                                                                                                                                                                                                    |
-| 0x8                    | Response status level                          |                 1 |               1 | EPROM          | read/write   | 0               | 1               | None         | 0: Except for read and PING instructions, other instructions do not return response packets.                                                                                                                                                                                                                                                                                                    |
-|                        |                                                |                   |                 |                |              |                 |                 |              | 1: Return response packets for all instructions                                                                                                                                                                                                                                                                                                                                                 |
-| 0x9                    | Minimum angle                                  |                 2 |               0 | EPROM          | read/write   | -32766          | --              | Step         | Set the minimum value limit for the motion range, which should be smaller than the maximum angle limit. When performing multi-turn absolute position control, this value is set to 0.                                                                                                                                                                                                           |
-| 0xB                    | Maximum angle                                  |                 2 |            4095 | EPROM          | read/write   | --              | 32767           | Step         | Set the maximum value limit for the motion range, which should be greater than the minimum angle limit. When performing multi-turn absolute position control, this value is set to 0.                                                                                                                                                                                                           |
-| 0xD                    | Maximum temperature                            |                 1 |              70 | EPROM          | read/write   | 0               | 100             | °C           | The maximum operating temperature limit, when set to 70, means the maximum temperature is 70 degrees Celsius, with a precision setting of 1 degree Celsius.                                                                                                                                                                                                                                     |
-| 0xE                    | Maximum input voltage                          |                 1 |              80 | EPROM          | read/write   | 0               | 254             | 0.1V         | If the maximum input voltage is set to 80, then the maximum operating voltage limit is 8.0V, with a precision setting of 0.1V.                                                                                                                                                                                                                                                                  |
-| 0xF                    | Minimum input voltage                          |                 1 |              40 | EPROM          | read/write   | 0               | 254             | 0.1V         | If the minimum input voltage is set to 40, then the minimum operating voltage limit is 4.0V, with a precision setting of 0.1V.                                                                                                                                                                                                                                                                  |
-| 0x10                   | Maximum torque                                 |                 2 |            1000 | EPROM          | read/write   | 0               | 1000            | nan          | Set the maximum output torque limit for the servo motor, where 1000 corresponds to 100% of the locked-rotor torque. Assign this value to address 48 upon power-up as the torque limit.                                                                                                                                                                                                          |
-| 0x12                   | Phase                                          |                 1 |              12 | EPROM          | read/write   | 0               | 254             | None         | Special function byte, do not modify unless there are specific requirements. Please refer to the special byte bit analysis for further details.                                                                                                                                                                                                                                                 |
-| 0x13                   | Unloading conditions                           |                 1 |              44 | EPROM          | read/write   | 0               | 254             | None         | Bit0  Bit1  Bit2 Bit3 Bit4 Bit5 set corresponding bit to 1 to enable the corresponding protection.                                                                                                                                                                                                                                                                                              |
-|                        |                                                |                   |                 |                |              |                 |                 |              | Voltage Sensor Temperature Current Angle Overload set corresponding bit to 0 to disable the corresponding protection                                                                                                                                                                                                                                                                            |
-| 0x14                   | LED alarm conditions                           |                 1 |              47 | EPROM          | read/write   | 0               | 254             | None         | Bit0  Bit1  Bit2 Bit3 Bit4 Bit5 set the corresponding bit to 1 to enable flashing  LED.                                                                                                                                                                                                                                                                                                         |
-|                        |                                                |                   |                 |                |              |                 |                 |              | Voltage Sensor Temperature Current Angle Overload set corresponding bit to 0 to disable the corresponding protection                                                                                                                                                                                                                                                                            |
-| 0x15                   | Position loop P (Proportional) coefficient     |                 1 |              32 | EPROM          | read/write   | 0               | 254             | None         | Proportional coefficient of control motor                                                                                                                                                                                                                                                                                                                                                       |
-| 0x16                   | Position loop D (Differential) coefficient     |                 1 |              32 | EPROM          | read/write   | 0               | 254             | None         | Differential coefficient of control motor                                                                                                                                                                                                                                                                                                                                                       |
-| 0x17                   | Position loop I (Integral) coefficient         |                 1 |               0 | EPROM          | read/write   | 0               | 254             | None         | Integral coefficient of the control motor                                                                                                                                                                                                                                                                                                                                                       |
-| 0x18                   | Minimum starting force                         |                 2 |              16 | EPROM          | read/write   | 0               | 1000            | nan          | Set the minimum output startup torque for the servo, where 1000 corresponds to 100% of the locked-rotor torque.                                                                                                                                                                                                                                                                                 |
-| 0x1A                   | Clockwise insensitive zone                     |                 1 |               1 | EPROM          | read/write   | 0               | 32              | Step         | The minimum unit is one minimum resolution angle.                                                                                                                                                                                                                                                                                                                                               |
-| 0x1B                   | Anti-clockwise insensitive zone                |                 1 |               1 | EPROM          | read/write   | 0               | 32              | Step         | The minimum unit is a minimum resolution angle.                                                                                                                                                                                                                                                                                                                                                 |
-| 0x1C                   | Protection current                             |                 2 |             500 | EPROM          | read/write   | 0               | 511             | 6.5mA        | The maximum settable current is 500 * 6.5mA= 3250mA.                                                                                                                                                                                                                                                                                                                                            |
-| 0x1E                   | Angle resolution                               |                 1 |               1 | EPROM          | read/write   | 1               | 3               | None         | For the amplification factor of the minimum resolution angle (degree/step) of the sensor, modifying this value can expand the number of control range. When performing the multi-turn control, you need to modify the parameter at address 0x12 by setting BIT4 to 1. This modification will result in the current position feedback value being adjusted to reflect the larger angle feedback. |
-| 0x1F                   | Position correction                            |                 2 |               0 | EPROM          | read/write   | -2047           | 2047            | Step         | BIT11 is the direction bit, indicating the positive and negative direction, and other bits can indicate the range of 0-2047 steps.                                                                                                                                                                                                                                                              |
-| 0x21                   | Operation mode                                 |                 1 |               0 | EPROM          | read/write   | 0               | 3               | None         | 0: position servo mode                                                                                                                                                                                                                                                                                                                                                                          |
-|                        |                                                |                   |                 |                |              |                 |                 |              | 1: motor constant speed mode, controlled by parameter 0x2E running speed parameter, the highest bit BIT15 is direction bit.                                                                                                                                                                                                                                                                     |
-|                        |                                                |                   |                 |                |              |                 |                 |              | 2: PWM open-loop speed regulation mode, controlled by parameter 0x2Cthe  running time parameter, BIT10 is direction bit                                                                                                                                                                                                                                                                         |
-|                        |                                                |                   |                 |                |              |                 |                 |              | 3: step servo mode, and the target position of parameter 0x2A is used to indicate the number of steps, and the highest bit BIT15 is the direction bit. When working                                                                                                                                                                                                                             |
-|                        |                                                |                   |                 |                |              |                 |                 |              | In mode 3, the minimum and maximum angle limits of 0x9 and 0xB must be set to 0. Otherwise, it is impossible to step indefinitely.                                                                                                                                                                                                                                                              |
-| 0x22                   | Protection torque                              |                 1 |              20 | EPROM          | read/write   | 0               | 100             | nan          | Output torque after entering overload protection. If 20 is set, it means 20% of the maximum torque.                                                                                                                                                                                                                                                                                             |
-| 0x23                   | Protection time                                |                 1 |             200 | EPROM          | read/write   | 0               | 254             | 10ms         | The duration for which the current load output exceeds the overload torque and remains is represented by a value, such as 200, which indicates 2 seconds. The maximum value that can be set is 2.5 seconds.                                                                                                                                                                                     |
-| 0x24                   | Overload torque                                |                 1 |              80 | EPROM          | read/write   | 0               | 100             | nan          | The maximum torque threshold for starting the overload protection time countdown can be represented by a value, such as 80, indicating 80% of the maximum torque.                                                                                                                                                                                                                               |
-| 0x25                   | Speed closed-loop proportional (P) coefficient |                 1 |              10 | EPROM          | read/write   | 0               | 100             | None         | Proportional coefficient of speed loop in motor constant speed mode (mode 1)                                                                                                                                                                                                                                                                                                                    |
-| 0x26                   | Overcurrent protection time                    |                 1 |             200 | EPROM          | read/write   | 0               | 254             | 10ms         | The maximum setting is 254 * 10ms = 2540ms.                                                                                                                                                                                                                                                                                                                                                     |
-| 0x27                   | Velocity closed-loop integral (I) coefficient  |                 1 |              10 | EPROM          | read/write   | 0               | 254             | 1/10         | In the motor constant speed mode (mode 1), the speed loop integral coefficient (change note: the speed closed loop I integral coefficient is reduced by 10 times compared with version 3.6).                                                                                                                                                                                                    |
-| 0x28                   | Torque switch                                  |                 1 |               0 | SRAM           | read/write   | 0               | 128             | None         | Write 0: disable the torque output; Write 1: enable the torque output; Write 128: Arbitrary current position correction to 2048.                                                                                                                                                                                                                                                                |
-| 0x29                   | Acceleration                                   |                 1 |               0 | SRAM           | read/write   | 0               | 254             | 100 step/s^2 | If set to 10, it corresponds to an acceleration and deceleration rate of 1000 steps per second squared.                                                                                                                                                                                                                                                                                         |
-| 0x2A                   | Target location                                |                 2 |               0 | SRAM           | read/write   | -30719          | 30719           | Step         | Each step corresponds to the minimum resolution angle, and it is used in absolute position control mode. The maximum number of steps corresponds to the maximum effective angle.                                                                                                                                                                                                                |
-| 0x2C                   | Operation time                                 |                 2 |               0 | SRAM           | read/write   | 0               | 1000            | nan          | In the PWM open-loop speed control mode, the value range is from 50 to 1000, and BIT10 serves as the direction bit.                                                                                                                                                                                                                                                                             |
-| 0x2E                   | Operation speed                                |                 2 |               0 | SRAM           | read/write   | 0               | 3400            | step/s       | Number of steps per unit time (per second), 50 steps per second = 0.732 RPM (revolutions per minute)                                                                                                                                                                                                                                                                                            |
-| 0x30                   | Torque limit                                   |                 2 |            1000 | SRAM           | read/write   | 0               | 1000            | nan          | The initial value of power-on will be assigned by the maximum torque (0x10), which can be modified by the user to control the output of the maximum torque.                                                                                                                                                                                                                                     |
-| 0x37                   | Lock flag                                      |                 1 |               0 | SRAM           | read/write   | 0               | 1               | None         | Writing 0: Disables the write lock, allowing values written to the EPROM address to be saved even after power loss.                                                                                                                                                                                                                                                                             |
-|                        |                                                |                   |                 |                |              |                 |                 |              | Writing 1: Enables the write lock, preventing values written to the EPROM address from being saved after power loss.                                                                                                                                                                                                                                                                            |
-| 0x38                   | Current location                               |                 2 |               0 | SRAM           | read only    | -1              | -1              | Step         | Feedback the number of steps in the current position, each step is a minimum resolution angle; Absolute position control mode, the maximum value corresponds to the maximum effective angle.                                                                                                                                                                                                    |
-| 0x3A                   | Current speed                                  |                 2 |               0 | SRAM           | read only    | -1              | -1              | step/s       | Feedback the current speed of motor rotation and the number of steps in unit time (per second).                                                                                                                                                                                                                                                                                                 |
-| 0x3C                   | Current load                                   |                 2 |               0 | SRAM           | read only    | -1              | -1              | nan          | The voltage duty cycle of the current control output driving motor.                                                                                                                                                                                                                                                                                                                             |
-| 0x3E                   | Current voltage                                |                 1 |               0 | SRAM           | read only    | -1              | -1              | 0.1V         | Current servo operation voltage                                                                                                                                                                                                                                                                                                                                                                 |
-| 0x3F                   | Current temperature                            |                 1 |               0 | SRAM           | read only    | -1              | -1              | °C           | Current servo internal operating temperature                                                                                                                                                                                                                                                                                                                                                    |
-| 0x40                   | Asynchronous write flag                        |                 1 |               0 | SRAM           | read only    | -1              | -1              | None         | The flag bit for using asynchronous write instructions                                                                                                                                                                                                                                                                                                                                          |
-| 0x41                   | Servo status                                   |                 1 |               0 | SRAM           | read only    | -1              | -1              | None         | Bit0  Bit1  Bit2 Bit3 Bit4 Bit5 the corresponding bit is set to 1 to indicate that the corresponding error occurs,                                                                                                                                                                                                                                                                              |
-|                        |                                                |                   |                 |                |              |                 |                 |              | Voltage Sensor Temperature Current Angle Overload the corresponding bit is set to 0 to indicate that there is no corresponding error.                                                                                                                                                                                                                                                           |
-| 0x42                   | Move flag                                      |                 1 |               0 | SRAM           | read only    | -1              | -1              | None         | The sign of the servo is 1 when it is moving, and 0 when it is stopped.                                                                                                                                                                                                                                                                                                                         |
-| 0x45                   | Current current                                |                 2 |               0 | SRAM           | read only    | -1              | -1              | 6.5mA        | The maximum measurable current is 500 * 6.5mA= 3250mA.                                                                                                                                                                                                                                                                                                                                          |

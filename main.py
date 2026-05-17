@@ -1,17 +1,26 @@
 import logging
+import os
 import sys
 
 import uvicorn
 
+from dotenv import load_dotenv
 from robot.config import Settings
 from robot.robot import Robot
 from web.app import create_app
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+
+# Set kinematics/robot modules to DEBUG when BIPED_DEBUG=1 (e.g. via VS Code launch config)
+if os.getenv("BIPED_DEBUG"):
+    for _mod in ("kinematics.solver", "kinematics.chain", "robot.robot", "hardware.servo_bus_manager"):
+        logging.getLogger(_mod).setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 

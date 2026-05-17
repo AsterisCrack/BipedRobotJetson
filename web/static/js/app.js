@@ -5,7 +5,7 @@
 
 import { initServos, onServoTelemetry } from './servos.js';
 import { onIMUTelemetry } from './imu.js';
-import { initRobot3D, onRobotTelemetry } from './robot3d.js';
+import { initRobot3D, onRobotTelemetry, onFKResult } from './robot3d.js';
 import { initIdManager } from './id_manager.js';
 import { initDebug, onDebugTelemetry } from './debug.js';
 
@@ -80,7 +80,26 @@ on('ik_result', msg => {
     console.warn('IK failed:', msg.message);
   }
 });
+on('fk_result', onFKResult);
 on('error', msg => console.error('Server error:', msg.message));
+
+// ── Simulation mode toggle ───────────────────────────────────────────────────
+const simBtn = document.getElementById('btn-sim-mode');
+function _applySimState(enabled) {
+  simBtn.textContent = enabled ? 'Sim Mode: ON' : 'Sim Mode: OFF';
+  simBtn.classList.toggle('active', enabled);
+}
+simBtn.addEventListener('click', () => {
+  const next = !simBtn.classList.contains('active');
+  fetch('/api/servos/simulation', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: next }),
+  })
+    .then(r => r.json())
+    .then(d => _applySimState(d.enabled));
+});
+fetch('/api/servos/simulation').then(r => r.json()).then(d => _applySimState(d.enabled));
 
 initServos();
 initRobot3D();

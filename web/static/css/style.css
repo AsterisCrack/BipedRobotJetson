@@ -35,8 +35,18 @@ nav { display: flex; gap: .4rem; }
 .tab-btn:hover { color: var(--text); border-color: var(--accent); }
 .tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
+.sim-btn {
+  margin-left: auto;
+  padding: .25rem .8rem; border-radius: 99px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text-dim);
+  font-size: .75rem; font-weight: 600; cursor: pointer; transition: .15s;
+}
+.sim-btn.active {
+  background: var(--warning); color: #000; border-color: var(--warning);
+}
+
 .ws-status {
-  margin-left: auto; padding: .25rem .7rem; border-radius: 99px;
+  padding: .25rem .7rem; border-radius: 99px;
   font-size: .75rem; font-weight: 600;
   background: var(--surface2); color: var(--warning);
 }
@@ -189,7 +199,19 @@ tbody td { padding: .4rem .6rem; vertical-align: middle; }
 #viewer-container {
   flex: 1; min-width: 0; background: var(--surface);
   border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  position: relative;
 }
+
+.axes-legend {
+  position: absolute; bottom: 0.5rem; left: 0.5rem;
+  background: rgba(13, 13, 26, 0.75);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 0.3rem 0.6rem; font-size: 0.72rem;
+  pointer-events: none; color: var(--text-dim); line-height: 1.8;
+}
+.ax-x { color: #ff4444; font-weight: 700; }
+.ax-y { color: #44cc44; font-weight: 700; }
+.ax-z { color: #4488ff; font-weight: 700; }
 
 .robot-controls {
   width: 300px; flex-shrink: 0; overflow-y: auto;
@@ -222,6 +244,37 @@ tbody td { padding: .4rem .6rem; vertical-align: middle; }
 .collapse-header.open .arrow { transform: rotate(90deg); }
 .collapse-body.hidden { display: none; }
 .collapse-body { margin-top: .5rem; }
+
+/* FK leg divider */
+.fk-leg-label {
+  font-size: .68rem; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--accent2); padding: .4rem 0 .15rem; margin-top: .25rem;
+}
+.fk-leg-label:first-child { padding-top: 0; margin-top: 0; }
+
+/* Servo config panel */
+.cfg-row {
+  display: grid; grid-template-columns: 1fr auto auto auto;
+  align-items: center; gap: .4rem; padding: .2rem 0; font-size: .8rem;
+  border-bottom: 1px solid var(--border);
+}
+.cfg-row:last-child { border-bottom: none; }
+.cfg-joint { color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dir-btn {
+  font-size: .72rem; padding: .12rem .35rem;
+  min-width: 2rem; text-align: center; font-variant-numeric: tabular-nums;
+}
+.dir-btn.positive { color: var(--success); border-color: var(--success); }
+.dir-btn.negative { color: var(--warning); border-color: var(--warning); }
+.cfg-default {
+  font-size: .72rem; color: var(--text-dim);
+  font-variant-numeric: tabular-nums; min-width: 3.8rem; text-align: right;
+}
+.set-default-btn { font-size: .68rem; padding: .12rem .35rem; }
+
+/* Print config row */
+.config-export-row { display: flex; align-items: center; gap: .6rem; }
+.config-export-status { font-size: .75rem; color: var(--success); }
 
 /* === Modals === */
 .modal-overlay {

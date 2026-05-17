@@ -14,7 +14,7 @@ No build step. Three.js and urdf-loader load from CDN at runtime. `workers=1` is
 
 **On Jetson** only:
 ```bash
-pip3 install -r requirements-hardware.txt   # adafruit-blinka + bno08x
+pip3 install -r requirements-hardware.txt   # adafruit-blinka + Jetson.GPIO
 ```
 
 ## Repository Structure & Dependency Layers
@@ -66,14 +66,17 @@ Use `robot.urdf_to_logical(leg, angles)` and `robot.logical_to_urdf(leg, angles)
 `hardware/servo_bus_manager.py:ServoBusManager` owns the serial bus exclusively in a daemon thread. Every cycle (~20 ms):
 
 1. **SYNC_READ** (SCS instruction `0x82`) — one broadcast packet, 12 sequential responses; all servo states updated atomically
-2. Read IMU
+2. Get latest IMU reading from `_IMUReaderThread` (~2 µs cache read — no I2C blocking)
 3. Update thread-safe state buffer
 4. Consume latest-wins command from command buffer
 5. **SYNC_WRITE** (SCS instruction `0x83`) if a command is pending
 
+The IMU runs in its own daemon thread (`_IMUReaderThread`) that reads BNO055 continuously over I2C in parallel with UART. The bus thread reads a cached value, removing the 4 ms I2C latency from the servo cycle.
+
 External code never touches the bus directly for position I/O. Interaction is non-blocking:
 - **Write**: `bus_manager.set_target_positions(urdf_angles, speed)` — merges into pending dict (latest-wins per joint)
-- **Read**: `bus_manager.get_servo_states()` / `get_cached_positions()` — returns a copy of the last state
+- **Read**: `bus_manager.get_servo_states()` / `get_cached_positions()` / `get_imu_state()` — returns a copy of the last state
+- **RL**: `bus_manager.get_rl_state()` — one-shot dict with positions, velocities, linear_accel, angular_vel, projected_gravity
 
 The bus lock in `SerialBus` still protects infrequent direct bus calls (ping, PID write, torque toggle, scan) from racing with the manager thread.
 
@@ -83,7 +86,7 @@ The bus lock in `SerialBus` still protects infrequent direct bus calls (ping, PI
 WebSocket command (set_foot_ik)
   → websocket.py: run_in_executor(robot.set_foot_position)   # IK off event loop
       → robot.py: _get_current_urdf_angles()                  # reads BusManager cache
-      → solver.py: ik() [scipy SLSQP]                         # URDF space
+      → solver.py: ik() [DLS]                                  # URDF space
       → robot.py: sync_write_positions(urdf_angles, raw=True) # skips offset layer
           → bus_manager.set_target_positions()                 # non-blocking enqueue
               → BusManager thread: _sync_write()               # next 20ms cycle
@@ -100,19 +103,21 @@ Telemetry (20 Hz, separate thread)
 
 | File | Role |
 |------|------|
-| `hardware/servo_bus_manager.py` | 50 Hz bus thread, SYNC_READ/SYNC_WRITE, state cache |
+| `hardware/servo_bus_manager.py` | 50 Hz bus thread, `_IMUReaderThread`, SYNC_READ/SYNC_WRITE, RL state API |
 | `hardware/serial_bus.py` | Thread-safe half-duplex UART; `transfer()`, `sync_read()`, `send_no_reply()` |
 | `hardware/st3215/protocol.py` | SCS packet encoding: `encode_sync_read`, `encode_sync_write`, checksum |
 | `hardware/st3215/registers.py` | Full ST3215 register + instruction map (`Reg`, `Instr`) |
 | `hardware/st3215/servo.py` | Per-servo driver: `deg_to_steps`, `steps_to_deg`, `get_status` |
-| `hardware/imu/bno085.py` | BNO085 IMU driver: quaternion → Euler, calibration |
+| `hardware/imu/bno055.py` | BNO055 IMU driver: single-bulk-read, quaternion → Euler |
 | `hardware/config.py` | `PIDConfig`, `ServoConfig`, `HardwareConfig` (Pydantic) |
 | `kinematics/chain.py` | URDF parser → 6-joint kinematic chain, FK via Rodrigues transforms |
-| `kinematics/solver.py` | `fk()` and `ik()` (scipy SLSQP, warm-start from current angles) |
+| `kinematics/solver.py` | `fk()` and `ik()` (DLS — Damped Least Squares, warm-start from current angles) |
 | `robot/robot.py` | Orchestrator: offset layer, motion commands, telemetry loop |
 | `robot/config.py` | Pydantic `Settings` — merges `.env` + both YAMLs |
 | `web/websocket.py` | WS dispatcher: IK in executor, uses `robot.urdf_to_logical()` / `robot.logical_to_urdf()` |
 | `web/app.py` | FastAPI factory, lifespan (starts telemetry, mounts routes) |
+| `tools/bus_profiler.py` | Bus timing profiler — real `ServoBusManager` harness, per-phase stats + histogram |
+| `tools/return_delay.py` | Read/zero the `RETURN_DELAY` EEPROM register on all servos |
 
 ### Half-duplex UART protocol notes
 
@@ -123,7 +128,7 @@ Checksum: `~(ID + LEN + INSTR + sum(PARAMS)) & 0xFF`
 
 ### IK
 
-IK is numerical (scipy SLSQP), not analytical — the hip offset geometry prevents closed-form solution. Always warm-started from current URDF-space joint angles. Falls back to L-BFGS-B on failure. Returns angles in URDF space; `websocket.py` converts to logical before sending to the UI via `robot.urdf_to_logical()`.
+IK is numerical (DLS — Damped Least Squares), not analytical — the hip offset geometry prevents closed-form solution. Always warm-started from current URDF-space joint angles; retries from standing pose if the warm-start fails. Returns angles in URDF space; `websocket.py` converts to logical before sending to the UI via `robot.urdf_to_logical()`.
 
 ## Adding a new pose
 
@@ -131,16 +136,27 @@ Add it to `config/robot.yaml` under `poses:` with joint angles in **logical spac
 
 ## RL integration point
 
-For 50 Hz NN inference, slot between the BusManager's state read and command write:
+Use `get_rl_state()` for a single-call observation snapshot:
 
 ```python
-# Each cycle:
+obs = bus_manager.get_rl_state()
+# obs keys:
+#   positions         list[float]               servo deg in config order (URDF space)
+#   velocities        list[int]                 servo speed counts (0 in BIPED_FAST_MODE)
+#   linear_accel      tuple[float, float, float] body-frame m/s²
+#   angular_vel       tuple[float, float, float] body-frame rad/s
+#   projected_gravity tuple[float, float, float] world [0,0,-1] rotated into body frame
+```
+
+Or compose individually at 50 Hz:
+
+```python
 urdf_angles = bus_manager.get_cached_positions()   # fast, non-blocking
 imu = bus_manager.get_imu_state()
 # → run NN policy inference here
 bus_manager.set_target_positions(policy_output_urdf, speed=0)  # non-blocking
 ```
 
-Policy inputs/outputs should be in URDF space. `default_position_deg` can be used to normalise inputs (subtract) and denormalise outputs (add) at the policy boundary.
+Policy inputs/outputs are in URDF space. `default_position_deg` can normalise inputs (subtract) and denormalise outputs (add) at the policy boundary.
 
 Or use the standalone `kinematics/` library directly alongside your own hardware access — it has no dependencies on `robot/` or `web/`.

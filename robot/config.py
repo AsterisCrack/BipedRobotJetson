@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     uart_port: str = "/dev/ttyTHS1"
     i2c_bus: int = 7
 
+    # Bus manager tuning — set in .env to override defaults.
+    # BIPED_RT_SCHEDULING=1  → SCHED_FIFO for bus thread (needs CAP_SYS_NICE or root)
+    # BIPED_FAST_MODE=1      → position-only SYNC_READ (no speed/load/voltage/temp)
+    biped_rt_scheduling: bool = False
+    biped_fast_mode: bool = False
+
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     robot: RobotConfig = Field(default_factory=RobotConfig)
 
@@ -44,6 +50,8 @@ class Settings(BaseSettings):
         return cls(
             uart_port=settings.uart_port,
             i2c_bus=settings.i2c_bus,
+            biped_rt_scheduling=settings.biped_rt_scheduling,
+            biped_fast_mode=settings.biped_fast_mode,
             hardware=hardware,
             robot=RobotConfig(**robot_data),
         )

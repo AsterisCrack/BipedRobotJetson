@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 
 import numpy as np
 
 from hardware.config import ServoConfig
-from hardware.imu.bno085 import BNO085, IMUReading
+from hardware.imu.bno055 import BNO055, IMUReading
 from hardware.serial_bus import SerialBus, SerialBusError
 from hardware.servo_bus_manager import ServoBusManager
 from hardware.st3215.protocol import encode_ping
@@ -50,8 +51,9 @@ class Robot:
             port=settings.hardware.uart_port,
             baud_rate=settings.hardware.baud_rate,
             timeout=settings.hardware.uart_timeout_s,
+            expect_echo=settings.hardware.expect_echo,
         )
-        self._imu = BNO085(
+        self._imu = BNO055(
             i2c_bus=settings.hardware.i2c_bus,
             address=settings.hardware.i2c_address,
         )
@@ -72,14 +74,31 @@ class Robot:
             for cfg in settings.robot.servos
         }
 
+        # Joint limits from URDF (degrees, logical space):
+        #   limit_lower ≤ logical_angle ≤ limit_upper
+        # "Logical" means relative to the calibrated standing position, so
+        # a limit of [-120°, +120°] means ±120° from default standing.
+        # In URDF space these become [default+lower, default+upper].
+        self._joint_limits_deg: dict[str, tuple[float, float]] = {}
+        for leg in ("left", "right"):
+            names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
+            for name, (lo_rad, hi_rad) in zip(names, self._chain.joint_limits(leg)):
+                self._joint_limits_deg[name] = (math.degrees(lo_rad), math.degrees(hi_rad))
+
         # Cached URDF positions used when BusManager has no data yet.
         self._cached_positions: dict[str, float] = {
             cfg.joint_name: cfg.default_position_deg for cfg in settings.robot.servos
         }
 
+        # When True, sync_write_positions() skips the bus write so the 3D
+        # model and IK/FK still work but no commands reach the physical servos.
+        self._sim_mode: bool = False
+
         # Bus manager: owns the serial bus in a dedicated 50 Hz thread.
         self._bus_manager = ServoBusManager(
-            list(self._servos.values()), self._bus, self._imu
+            list(self._servos.values()), self._bus, self._imu,
+            rt_scheduling=self._settings.biped_rt_scheduling,
+            fast_mode=self._settings.biped_fast_mode,
         )
 
         self._telemetry_thread: threading.Thread | None = None
@@ -221,17 +240,38 @@ class Robot:
             raw:          if True, treat angles as URDF space (no offset added).
                           Use only for Debug-tab direct servo control.
         """
+        # Enforce URDF joint limits before converting / forwarding.
+        # Limits are stored in logical space (relative to default standing).
+        # For raw=True (URDF input), shift limits by default_position_deg.
+        safe: dict[str, float] = {}
+        for name, angle in joint_angles.items():
+            if name in self._joint_limits_deg:
+                lo, hi = self._joint_limits_deg[name]
+                if raw:
+                    default = self._default_offsets.get(name, 0.0)
+                    lo, hi = lo + default, hi + default
+                clamped = max(lo, min(hi, angle))
+                if abs(clamped - angle) > 0.1:
+                    logger.warning(
+                        "Joint %s: command %.2f° clamped to %.2f° (%s space)",
+                        name, angle, clamped, "URDF" if raw else "logical",
+                    )
+                safe[name] = clamped
+            else:
+                safe[name] = angle
+
         if raw:
-            urdf_angles = joint_angles
+            urdf_angles = safe
         else:
             urdf_angles = {
                 name: deg + self._default_offsets.get(name, 0.0)
-                for name, deg in joint_angles.items()
+                for name, deg in safe.items()
             }
 
-        # Keep cache in URDF space for FK/IK warm-start.
+        # Keep cache in URDF space for FK/IK warm-start (always, even in sim mode).
         self._cached_positions.update(urdf_angles)
-        self._bus_manager.set_target_positions(urdf_angles, speed)
+        if not self._sim_mode:
+            self._bus_manager.set_target_positions(urdf_angles, speed)
 
     def go_to_pose(self, pose_name: str, speed: int = 300) -> None:
         """Send robot to a named pose. Pose angles are in logical space."""
@@ -247,13 +287,13 @@ class Robot:
     # IK / FK
     # ------------------------------------------------------------------
 
-    def set_foot_position(self, leg: str, x: float, y: float, z: float) -> IKResult:
+    def set_foot_position(
+        self, leg: str, x: float, y: float, z: float, target_rot=None
+    ) -> IKResult:
         """IK solver — runs in caller's thread; use run_in_executor from async code."""
-        current = self._get_current_urdf_angles(leg)
-        result = self._solver.ik(leg, target_pos=np.array([x, y, z]), initial_angles_deg=current)
+        result = self._run_ik(leg, x, y, z, target_rot)
         if result.success:
             names = KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
-            # result.angles_deg is in URDF space; send raw=True
             self.sync_write_positions(dict(zip(names, result.angles_deg)), raw=True)
         else:
             logger.warning(
@@ -262,12 +302,31 @@ class Robot:
             )
         return result
 
-    def compute_ik(self, leg: str, x: float, y: float, z: float) -> IKResult:
+    def compute_ik(
+        self, leg: str, x: float, y: float, z: float, target_rot=None
+    ) -> IKResult:
         """Run IK without executing motion. Returns IKResult in URDF space."""
+        return self._run_ik(leg, x, y, z, target_rot)
+
+    def _run_ik(
+        self, leg: str, x: float, y: float, z: float, target_rot=None
+    ) -> IKResult:
+        """Run IK with multi-start: first from current angles, then from standing."""
+        target = np.array([x, y, z])
         current = self._get_current_urdf_angles(leg)
-        return self._solver.ik(
-            leg, target_pos=np.array([x, y, z]), initial_angles_deg=current
-        )
+        result = self._solver.ik(leg, target, target_rot, initial_angles_deg=current)
+        if not result.success:
+            # Retry from calibrated standing angles — avoids local minima when the
+            # robot is in an unusual posture that misguides the warm-start.
+            standing = [self._default_offsets.get(n, 0.0) for n in self.leg_joint_names(leg)]
+            r2 = self._solver.ik(leg, target, target_rot, initial_angles_deg=standing)
+            if r2.position_error_m < result.position_error_m:
+                logger.debug(
+                    "IK leg=%s: retry from standing improved error %.4f→%.4f m",
+                    leg, result.position_error_m, r2.position_error_m,
+                )
+                result = r2
+        return result
 
     def get_foot_position(self, leg: str) -> dict:
         return self._solver.fk(leg, self._get_current_urdf_angles(leg))
@@ -312,13 +371,59 @@ class Robot:
         """Return the ordered list of joint names for the given leg."""
         return KinematicChain.LEFT_JOINTS if leg == "left" else KinematicChain.RIGHT_JOINTS
 
+    def set_servo_default_position(self, servo_id: int, deg: float) -> None:
+        servo = self._servos_by_id[servo_id]
+        servo.default_position_deg = deg
+        self._default_offsets[servo.joint_name] = deg
+
+    def get_servo_configs(self) -> list[dict]:
+        return [
+            {
+                "servo_id": servo.servo_id,
+                "joint_name": servo.joint_name,
+                "direction_sign": servo.direction_sign,
+                "zero_offset_steps": servo.zero_offset_steps,
+                "default_position_deg": round(servo.default_position_deg, 4),
+                "pid": {
+                    "p": servo._cfg.pid.p,
+                    "d": servo._cfg.pid.d,
+                    "i": servo._cfg.pid.i,
+                },
+            }
+            for servo in self._servos.values()
+        ]
+
+    def export_config(self) -> dict:
+        return {
+            "urdf_path": self._settings.robot.urdf_path,
+            "home_pose": self._settings.robot.home_pose,
+            "servos": self.get_servo_configs(),
+            "poses": self._settings.robot.poses,
+        }
+
     # ------------------------------------------------------------------
     # Config helpers (public — for web layer)
     # ------------------------------------------------------------------
 
+    def set_simulation_mode(self, enabled: bool) -> None:
+        self._sim_mode = enabled
+        logger.info("Simulation mode %s", "ON — servo writes suppressed" if enabled else "OFF")
+
+    @property
+    def simulation_mode(self) -> bool:
+        return self._sim_mode
+
     def list_pose_names(self) -> list[str]:
         """Return names of all configured poses."""
         return list(self._settings.robot.poses.keys())
+
+    def get_pose(self, name: str) -> dict[str, float]:
+        """Return pose joint angles in logical space (0 = default standing)."""
+        if name not in self._settings.robot.poses:
+            raise KeyError(f"Unknown pose: {name!r}")
+        all_joints = KinematicChain.LEFT_JOINTS + KinematicChain.RIGHT_JOINTS
+        pose = self._settings.robot.poses[name]
+        return {j: float(pose.get(j, 0.0)) for j in all_joints}
 
     def home_pose_name(self) -> str:
         """Return the name of the home pose."""

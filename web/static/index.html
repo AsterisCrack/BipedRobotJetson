@@ -26,6 +26,7 @@
       <button class="tab-btn" data-tab="robot">Robot</button>
       <button class="tab-btn" data-tab="debug">Debug</button>
     </nav>
+    <button id="btn-sim-mode" class="sim-btn" title="Toggle simulation mode — suppresses all physical servo writes">Sim Mode: OFF</button>
     <div class="ws-status" id="ws-status">Connecting…</div>
   </header>
 
@@ -116,12 +117,20 @@
         </div>
 
         <div class="control-section collapsible">
-          <h3 class="collapse-header">FK — Left Leg <span class="arrow">▸</span></h3>
-          <div id="fk-left" class="fk-group collapse-body hidden" data-leg="left"></div>
+          <h3 class="collapse-header">FK <span class="arrow">▸</span></h3>
+          <div id="fk-all" class="fk-group collapse-body hidden"></div>
         </div>
+
         <div class="control-section collapsible">
-          <h3 class="collapse-header">FK — Right Leg <span class="arrow">▸</span></h3>
-          <div id="fk-right" class="fk-group collapse-body hidden" data-leg="right"></div>
+          <h3 class="collapse-header">Config <span class="arrow">▸</span></h3>
+          <div class="collapse-body hidden" id="servo-config-panel"></div>
+        </div>
+
+        <div class="control-section">
+          <div class="config-export-row">
+            <button id="btn-print-config" class="primary">Print Config</button>
+            <span id="config-export-status" class="config-export-status"></span>
+          </div>
         </div>
       </div>
     </div>

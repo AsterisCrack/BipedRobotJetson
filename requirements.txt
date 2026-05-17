@@ -12,7 +12,6 @@ pydantic>=2.5
 pydantic-settings>=2.2
 pyyaml>=6.0
 
-# IMU (Jetson Orin Nano)
-# adafruit-blinka               # CircuitPython HAL for Jetson
-# adafruit-circuitpython-bno08x # BNO085 driver
-# Uncomment above two lines on the Jetson; they are not needed for simulation/dev
+# IMU (Jetson Orin Nano) — install via requirements-hardware.txt
+# Jetson.GPIO        # required by adafruit-blinka for Jetson platform detection
+# adafruit-blinka    # provides Adafruit_PureIO.smbus for BNO055 I2C register access

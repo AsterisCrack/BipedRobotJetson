@@ -68,6 +68,12 @@ class ST3215:
     def direction_sign(self) -> int:
         return self._cfg.direction_sign
 
+    @direction_sign.setter
+    def direction_sign(self, value: int) -> None:
+        if value not in (-1, 1):
+            raise ValueError(f"direction_sign must be -1 or 1, got {value!r}")
+        self._cfg.direction_sign = value
+
     @property
     def default_position_deg(self) -> float:
         return self._cfg.default_position_deg
@@ -212,8 +218,9 @@ class ST3215:
     def set_id(self, new_id: int) -> None:
         if not (0 <= new_id <= 253):
             raise ValueError(f"Servo ID must be 0-253, got {new_id}")
-        self.disable_torque()
+        self.write_register(Reg.LOCK_FLAG, bytes([0]))   # unlock EEPROM
         self.write_register(Reg.ID, bytes([new_id]))
+        self.write_register(Reg.LOCK_FLAG, bytes([1]))   # re-lock EEPROM
         logger.info("Servo %d → new ID %d (reconnect to verify)", self._cfg.servo_id, new_id)
         self._cfg.servo_id = new_id
 

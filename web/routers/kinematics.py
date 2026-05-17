@@ -64,6 +64,15 @@ def list_poses(request: Request) -> list[str]:
     return _robot(request).list_pose_names()
 
 
+@router.get("/poses/{name}")
+def get_pose(name: str, request: Request) -> dict:
+    robot = _robot(request)
+    try:
+        return robot.get_pose(name)
+    except KeyError:
+        raise HTTPException(404, f"Pose {name!r} not found")
+
+
 @router.post("/poses/{name}")
 def execute_pose(name: str, request: Request):
     robot = _robot(request)

@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+
+import numpy as np
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -92,12 +95,18 @@ class TelemetryBroadcaster:
                 await _ack(ws, msg_type)
 
             elif msg_type == "set_foot_ik":
-                # Run IK in thread pool so the event loop stays responsive.
                 leg = msg["leg"]
                 x, y, z = float(msg["x"]), float(msg["y"]), float(msg["z"])
+                target_rot = None
+                if "roll" in msg:
+                    target_rot = _rpy_to_matrix(
+                        math.radians(float(msg["roll"])),
+                        math.radians(float(msg["pitch"])),
+                        math.radians(float(msg["yaw"])),
+                    )
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
-                    None, robot.set_foot_position, leg, x, y, z
+                    None, robot.set_foot_position, leg, x, y, z, target_rot
                 )
                 # result.angles_deg is URDF space; convert to logical for UI.
                 logical_angles = robot.urdf_to_logical(leg, result.angles_deg)
@@ -123,6 +132,7 @@ class TelemetryBroadcaster:
                     "type": "fk_result",
                     "leg": leg,
                     "position": fk["position"],
+                    "rotation_matrix": fk["rotation_matrix"],
                 }))
 
             else:
@@ -137,3 +147,14 @@ class TelemetryBroadcaster:
 
 async def _ack(ws: WebSocket, cmd: str, **extra) -> None:
     await ws.send_text(json.dumps({"type": "ack", "cmd": cmd, "success": True, **extra}))
+
+
+def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Extrinsic XYZ Euler angles (radians) → 3×3 rotation matrix (Rz @ Ry @ Rx)."""
+    cr, sr = math.cos(roll),  math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw),   math.sin(yaw)
+    Rx = np.array([[1, 0, 0],  [0, cr, -sr], [0, sr,  cr]])
+    Ry = np.array([[cp, 0, sp], [0,  1,   0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0],  [0,  0,  1]])
+    return Rz @ Ry @ Rx

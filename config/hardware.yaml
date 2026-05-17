@@ -1,6 +1,6 @@
 uart_port: /dev/ttyTHS1
 baud_rate: 1000000
 i2c_bus: 7
-i2c_address: 0x4A
-uart_timeout_s: 0.05
+i2c_address: 0x28  # BNO055 (ADDR pin low)
+uart_timeout_s: 0.005
 max_retries: 3

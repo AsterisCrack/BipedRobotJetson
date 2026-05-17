@@ -29,6 +29,7 @@ class HardwareConfig(BaseModel):
     uart_port: str = "/dev/ttyTHS1"
     baud_rate: int = 1_000_000
     i2c_bus: int = 7
-    i2c_address: int = 0x4A
+    i2c_address: int = 0x28  # BNO055 default (ADDR pin low)
     uart_timeout_s: float = 0.05
     max_retries: int = 3
+    expect_echo: bool = False
