@@ -8,6 +8,7 @@ import { onIMUTelemetry } from './imu.js';
 import { initRobot3D, onRobotTelemetry } from './robot3d.js';
 import { initIdManager } from './id_manager.js';
 import { initDebug, onDebugTelemetry } from './debug.js';
+import { initPolicy } from './policy.js';
 
 // ── Tab routing ──────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -86,4 +87,5 @@ initServos();
 initRobot3D();
 initIdManager();
 initDebug();
+initPolicy();
 connect();

@@ -16,6 +16,7 @@ from hardware.st3215.servo import ST3215, ServoStatus
 from kinematics.chain import KinematicChain
 from kinematics.solver import IKResult, KinematicSolver
 from robot.config import Settings
+from robot.policy_executor import PolicyExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class Robot:
                        servo driver internals.
       - Logical space: 0° = calibrated standing position (default_position_deg).
                        Used in poses, sliders, and telemetry display.
-                       logical = urdf − default_position_deg
+                       logical = urdf - default_position_deg
 
     All public motion commands (sync_write_positions, go_to_pose, …) accept
     logical angles by default.  Pass raw=True to bypass the offset and send
@@ -82,6 +83,8 @@ class Robot:
             list(self._servos.values()), self._bus, self._imu
         )
 
+        self._policy: PolicyExecutor | None = None
+
         self._telemetry_thread: threading.Thread | None = None
         self._stop_telemetry = threading.Event()
 
@@ -127,6 +130,8 @@ class Robot:
         self._stop_telemetry.set()
         if self._telemetry_thread and self._telemetry_thread.is_alive():
             self._telemetry_thread.join(timeout=2.0)
+        if self._policy:
+            self._policy.disable()
         self._bus_manager.stop()
         try:
             self.disable_all_torques()
@@ -316,6 +321,40 @@ class Robot:
     # Config helpers (public — for web layer)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Policy executor
+    # ------------------------------------------------------------------
+
+    @property
+    def policy(self) -> PolicyExecutor | None:
+        return self._policy
+
+    def load_policy(
+        self,
+        weights_path: str,
+        submodule_path: str,
+        config_path: str | None = None,
+        action_scale_deg: float = 40.0,
+    ) -> PolicyExecutor:
+        if self._policy and self._policy.state != "idle":
+            self._policy.disable()
+        self._policy = PolicyExecutor(
+            bus_manager=self._bus_manager,
+            default_offsets=self._default_offsets,
+            write_fn=self.sync_write_positions,
+            disable_torques_fn=self.disable_all_torques,
+            enable_torques_fn=self.enable_all_torques,
+            weights_path=weights_path,
+            submodule_path=submodule_path,
+            config_path=config_path,
+            action_scale_deg=action_scale_deg,
+        )
+        return self._policy
+
+    # ------------------------------------------------------------------
+    # Config helpers (public — for web layer)
+    # ------------------------------------------------------------------
+
     def list_pose_names(self) -> list[str]:
         """Return names of all configured poses."""
         return list(self._settings.robot.poses.keys())
@@ -430,6 +469,15 @@ class Robot:
                     },
                 },
             }
+
+            if self._policy:
+                vx, vy, wz = self._policy.get_command()
+                frame["policy"] = {
+                    "state": self._policy.state,
+                    "vx": vx, "vy": vy, "wz": wz,
+                }
+            else:
+                frame["policy"] = {"state": "idle", "vx": 0.0, "vy": 0.0, "wz": 0.0}
 
             asyncio.run_coroutine_threadsafe(queue.put(frame), loop)
 

@@ -194,7 +194,7 @@ def rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
 
 
 def _joint_transform(joint: JointInfo, angle: float) -> np.ndarray:
-    """4×4 homogeneous transform for a joint at the given angle (rad)."""
+    """4x4 homogeneous transform for a joint at the given angle (rad)."""
     R_origin = _rpy_to_matrix(joint.origin_rpy)
     R_joint = rotation_matrix(joint.axis, angle)
     R = R_origin @ R_joint

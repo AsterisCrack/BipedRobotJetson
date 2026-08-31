@@ -25,6 +25,7 @@
       <button class="tab-btn" data-tab="imu">IMU</button>
       <button class="tab-btn" data-tab="robot">Robot</button>
       <button class="tab-btn" data-tab="debug">Debug</button>
+      <button class="tab-btn" data-tab="policy">Policy</button>
     </nav>
     <div class="ws-status" id="ws-status">Connecting…</div>
   </header>
@@ -227,6 +228,82 @@
         <canvas id="debug-graph" width="960" height="280"></canvas>
         <div class="debug-legend" id="debug-legend"></div>
       </section>
+    </div>
+  </div>
+
+  <!-- POLICY TAB -->
+  <div class="tab-panel" id="tab-policy">
+    <div class="policy-page">
+
+      <!-- Load section -->
+      <section class="policy-card">
+        <h3>Load Policy</h3>
+        <div class="policy-form">
+          <label>Weights path
+            <input type="text" id="policy-weights-path" placeholder="/path/to/checkpoint.pt" spellcheck="false">
+          </label>
+          <label>Submodule path
+            <input type="text" id="policy-submodule-path" placeholder="torch_rl_algorithms" value="torch_rl_algorithms" spellcheck="false">
+          </label>
+          <label>Config path <span class="hint-inline">(optional)</span>
+            <input type="text" id="policy-config-path" placeholder="/path/to/config.yaml" spellcheck="false">
+          </label>
+          <label>Action scale °
+            <input type="number" id="policy-action-scale" value="40" min="1" max="90" step="1">
+          </label>
+        </div>
+        <div class="policy-load-row">
+          <button id="btn-policy-load" class="primary">Load</button>
+          <span id="policy-load-status" class="policy-load-status"></span>
+        </div>
+      </section>
+
+      <!-- Control section -->
+      <section class="policy-card">
+        <h3>Control</h3>
+
+        <div class="policy-status-row">
+          <span>State</span>
+          <span id="policy-state" class="policy-state-badge policy-state-idle">Idle</span>
+          <button id="btn-policy-enable" class="primary" disabled>Enable</button>
+          <button id="btn-policy-disable">Disable</button>
+        </div>
+
+        <!-- Key grid -->
+        <div class="key-grid">
+          <div class="key-row">
+            <span id="key-q" class="key-cap">Q<span class="key-label">↺ turn</span></span>
+            <span id="key-w" class="key-cap">W<span class="key-label">↑ fwd</span></span>
+            <span id="key-e" class="key-cap">E<span class="key-label">↻ turn</span></span>
+          </div>
+          <div class="key-row">
+            <span id="key-a" class="key-cap">A<span class="key-label">← left</span></span>
+            <span id="key-s" class="key-cap">S<span class="key-label">↓ back</span></span>
+            <span id="key-d" class="key-cap">D<span class="key-label">→ right</span></span>
+          </div>
+        </div>
+
+        <!-- Magnitudes -->
+        <div class="policy-mags">
+          <label>vx m/s
+            <input type="number" id="mag-vx" value="0.30" min="0" max="2" step="0.05">
+          </label>
+          <label>vy m/s
+            <input type="number" id="mag-vy" value="0.20" min="0" max="2" step="0.05">
+          </label>
+          <label>wz rad/s
+            <input type="number" id="mag-wz" value="0.50" min="0" max="3" step="0.05">
+          </label>
+        </div>
+
+        <!-- Live command display -->
+        <div class="policy-cmd-display">
+          <div class="cmd-row"><span>vx</span><span id="cmd-vx" class="cmd-val">0.00</span><span>m/s</span></div>
+          <div class="cmd-row"><span>vy</span><span id="cmd-vy" class="cmd-val">0.00</span><span>m/s</span></div>
+          <div class="cmd-row"><span>wz</span><span id="cmd-wz" class="cmd-val">0.00</span><span>rad/s</span></div>
+        </div>
+      </section>
+
     </div>
   </div>
 

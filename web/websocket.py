@@ -125,6 +125,23 @@ class TelemetryBroadcaster:
                     "position": fk["position"],
                 }))
 
+            elif msg_type == "set_velocity":
+                if robot.policy is None:
+                    raise KeyError("No policy loaded")
+                robot.policy.set_command(
+                    float(msg["vx"]), float(msg["vy"]), float(msg["wz"])
+                )
+                await _ack(ws, msg_type)
+
+            elif msg_type == "set_policy_enabled":
+                if robot.policy is None:
+                    raise KeyError("No policy loaded")
+                if msg["enabled"]:
+                    robot.policy.enable()
+                else:
+                    robot.policy.disable()
+                await _ack(ws, msg_type)
+
             else:
                 await ws.send_text(json.dumps({"type": "error", "message": f"Unknown command: {msg_type}"}))
 

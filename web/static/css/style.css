@@ -245,6 +245,80 @@ tbody td { padding: .4rem .6rem; vertical-align: middle; }
 .modal .warn { font-size: .75rem; color: var(--warning); margin-bottom: .8rem; }
 .modal-actions { display: flex; gap: .6rem; margin-top: 1rem; justify-content: flex-end; }
 
+/* === Policy tab === */
+.policy-page {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; max-width: 900px;
+}
+.policy-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 1.2rem;
+}
+.policy-card h3 { font-size: .9rem; color: var(--accent); margin-bottom: 1rem; }
+
+.policy-form { display: flex; flex-direction: column; gap: .6rem; margin-bottom: .8rem; }
+.policy-form label {
+  display: flex; flex-direction: column; gap: .25rem;
+  font-size: .78rem; color: var(--text-dim);
+}
+.policy-form input[type=text],
+.policy-form input[type=number] {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); padding: .3rem .5rem; font-size: .82rem; font-family: monospace;
+}
+.hint-inline { font-size: .7rem; color: var(--text-dim); }
+.policy-load-row { display: flex; align-items: center; gap: .8rem; }
+.policy-load-status { font-size: .78rem; }
+.policy-load-status.ok    { color: var(--success); }
+.policy-load-status.error { color: var(--danger); }
+
+.policy-status-row {
+  display: flex; align-items: center; gap: .8rem; margin-bottom: 1.2rem;
+  font-size: .83rem; color: var(--text-dim);
+}
+.policy-state-badge {
+  padding: .2rem .6rem; border-radius: 99px; font-size: .75rem; font-weight: 600;
+}
+.policy-state-idle       { background: var(--surface2); color: var(--text-dim); }
+.policy-state-running    { background: #1a3a1a; color: var(--success); }
+.policy-state-fallen     { background: #3a1a1a; color: var(--danger); }
+.policy-state-recovering { background: #3a2a0a; color: var(--warning); }
+
+/* Key grid */
+.key-grid { display: flex; flex-direction: column; gap: .35rem; margin-bottom: 1.2rem; }
+.key-row  { display: flex; gap: .35rem; }
+.key-cap {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  width: 64px; height: 52px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface2); font-size: .85rem; font-weight: 700; color: var(--text-dim);
+  user-select: none; cursor: default; transition: .1s;
+}
+.key-cap.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.key-label { font-size: .62rem; font-weight: 400; color: inherit; margin-top: .15rem; }
+
+/* Magnitude inputs */
+.policy-mags {
+  display: flex; gap: .8rem; margin-bottom: 1.2rem; flex-wrap: wrap;
+}
+.policy-mags label {
+  display: flex; flex-direction: column; gap: .25rem;
+  font-size: .78rem; color: var(--text-dim); flex: 1; min-width: 70px;
+}
+.policy-mags input {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); padding: .3rem .4rem; font-size: .82rem; text-align: right;
+}
+
+/* Command display */
+.policy-cmd-display { display: flex; flex-direction: column; gap: .4rem; }
+.cmd-row {
+  display: flex; align-items: baseline; gap: .5rem;
+  font-size: .82rem; color: var(--text-dim);
+}
+.cmd-val {
+  font-size: 1.1rem; font-weight: 700; color: var(--text);
+  font-variant-numeric: tabular-nums; min-width: 3.5rem; text-align: right;
+}
+
 /* === Scrollbar === */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
