@@ -1,0 +1,12 @@
+{
+  "source_checkpoint": "BipedRobot\\checkpoints\\BipedV2_SAC_2026-09-28_14-51-15\\step_270336000.pt",
+  "run": "BipedV2_SAC_2026-09-28_14-51-15",
+  "step": "270336000",
+  "exported_utc": "2026-09-28T18:24:13.219833+00:00",
+  "git_sha": "58e3b76",
+  "hidden_sizes": [
+    1024,
+    512,
+    256
+  ]
+}

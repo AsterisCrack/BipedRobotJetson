@@ -12,6 +12,14 @@ pydantic>=2.5
 pydantic-settings>=2.2
 pyyaml>=6.0
 
+# RL policy inference (optional — the server starts without it, with the Control
+# tab reporting "unavailable"). CPU execution provider is deliberate: the actor is
+# a 250->1024->512->256->12 MLP, ~1.4 MFLOP/step, which runs in well under 1 ms on
+# an Orin CPU core against a ~16.9 ms per-cycle budget. onnxruntime-gpu would mean
+# hunting NVIDIA's aarch64 wheel (the pip default has no CUDA EP for ARM) for no
+# measurable gain at this size.
+onnxruntime>=1.16
+
 # IMU (Jetson Orin Nano) — install via requirements-hardware.txt
 # Jetson.GPIO        # required by adafruit-blinka for Jetson platform detection
 # adafruit-blinka    # provides Adafruit_PureIO.smbus for BNO055 I2C register access

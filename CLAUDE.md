@@ -134,7 +134,54 @@ IK is numerical (DLS — Damped Least Squares), not analytical — the hip offse
 
 Add it to `config/robot.yaml` under `poses:` with joint angles in **logical space** (0 = default standing position for each joint). The UI picks it up automatically via `/api/kinematics/poses`.
 
-## RL integration point
+## RL policy (implemented)
+
+`policy/` runs an exported ONNX actor inside the bus thread. Layering: it imports
+`hardware/` and `robot/`; only `web/` and `robot/` import it.
+
+| File | Role |
+|------|------|
+| `policy/deploy_config.py` | Loads/validates an exported bundle |
+| `policy/observation.py` | Pure numpy: joint permutation, 50-dim frame, history ring, gait clock |
+| `policy/policy_runner.py` | ONNX session, EMA filter, arming ramp; `step()` called per bus cycle |
+| `policy/safety.py` | Tilt fault, action-rate limit, observation sanity |
+| `policy/state_machine.py` | `IDLE → ARMING → ARMED → RUNNING → FAULT` |
+| `policy/selftest.py` | Dry run with torque off — **run before first arm** |
+
+### Bundle
+
+Produced by `BipedRobot/src/isaaclab/export_onnx.py`, dropped in `models/<name>/`:
+`policy.onnx` + `deploy_config.json` + `checkpoint_info.json`. Nothing from the
+training repo is imported at runtime.
+
+### Things that will silently break it
+
+**Joint order differs.** Isaac interleaves L/R (`l_hip_yaw, r_hip_yaw, l_hip_roll, …`);
+this robot is per-leg (all left, then all right). `JointMapper` permutes **by name** —
+never index into `get_rl_state()["positions"]` positionally, it is ordered by
+`config/robot.yaml` and that is not an enforced invariant.
+
+**Two normalizers.** Stage 1 (`obs_mean`/`obs_var` in `deploy_config.json`) is applied
+by the runtime; stage 2 is baked into the ONNX. Both are trained and non-identity.
+
+**The BNO055 `accel` field is gravity-free.** The policy trained on specific force
+(gravity included, ~+9.81 z upright). `specific_force_from_linear_accel()` reconstructs
+it as `linear_accel − 9.81 × projected_gravity`.
+
+**The EMA filter runs 4× per control step**, not once — Isaac applies it inside its
+decimation loop, so effective α is `1 − 0.6⁴ = 0.87`, not 0.4.
+
+**Joint velocity is finite-differenced**, not read from the servo. The speed register is
+uncalibrated raw counts and reads zero under `BIPED_FAST_MODE`.
+
+### Calibration prerequisite
+
+Isaac's standing pose is URDF zero (`default_joint_pos` is all zeros). `config/robot.yaml`
+says this robot stands at `l_hip_yaw = −33.66°`, `l_knee_joint = +134.38°`. If those offsets
+are mechanical, part of the policy's commanded range is unreachable and will be clamped.
+Verify with `python3 -m policy.selftest --model <name>` before arming.
+
+## RL integration point (low-level)
 
 Use `get_rl_state()` for a single-call observation snapshot:
 

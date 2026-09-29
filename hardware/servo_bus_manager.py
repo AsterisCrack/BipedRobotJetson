@@ -140,6 +140,11 @@ class ServoBusManager:
         self._pending_positions: dict[str, float] | None = None
         self._pending_speed: int = 300
 
+        # Optional per-cycle callback for closed-loop control (RL policy inference).
+        # Invoked from the bus thread after state is updated, so it sees the freshest
+        # reading and its command lands on the very next SYNC_WRITE.
+        self._policy_hook = None
+
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._imu_reader: _IMUReaderThread | None = None
@@ -188,6 +193,18 @@ class ServoBusManager:
     # ------------------------------------------------------------------
     # Public API (thread-safe, non-blocking)
     # ------------------------------------------------------------------
+
+    def set_policy_hook(self, hook) -> None:
+        """Attach/detach a per-cycle callback run inside the 50 Hz bus thread.
+
+        ``hook(bus_manager)`` is called once per cycle after the state buffer is
+        updated. Pass ``None`` to detach. The hook MUST return promptly -- the
+        measured spare budget is ~16.9 ms of the 20 ms period, and overrunning it
+        delays the next SYNC_READ.
+
+        The hook is detached automatically if it raises.
+        """
+        self._policy_hook = hook
 
     def set_target_positions(
         self, joint_angles: dict[str, float], speed: int = 300
@@ -372,6 +389,23 @@ class ServoBusManager:
             self._update_state(servo_states, imu)
             if p:
                 self._prof_t_state_us.append((time.monotonic_ns() - t0) / 1000.0)
+
+            # --- Policy inference (uses the spare time measured below) ---
+            # The hook reads state via get_rl_state() and writes back through
+            # set_target_positions(), both of which are already non-blocking, so it
+            # composes with the cycle rather than extending the UART critical path.
+            #
+            # Guarded unconditionally: an exception escaping here would kill the
+            # thread that owns the serial bus, which takes the whole robot down
+            # including the ability to cut torque. The hook is expected to fault
+            # itself, but we must not rely on that.
+            hook = self._policy_hook
+            if hook is not None:
+                try:
+                    hook(self)
+                except Exception:
+                    logger.exception("policy hook raised; detaching it")
+                    self._policy_hook = None
 
             # --- Spare time (available for NN inference between cycles) ---
             t_work_done = time.monotonic_ns()

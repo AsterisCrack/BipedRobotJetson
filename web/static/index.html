@@ -25,6 +25,7 @@
       <button class="tab-btn" data-tab="imu">IMU</button>
       <button class="tab-btn" data-tab="robot">Robot</button>
       <button class="tab-btn" data-tab="debug">Debug</button>
+      <button class="tab-btn" data-tab="control">Control</button>
     </nav>
     <button id="btn-sim-mode" class="sim-btn" title="Toggle simulation mode — suppresses all physical servo writes">Sim Mode: OFF</button>
     <div class="ws-status" id="ws-status">Connecting…</div>
@@ -258,6 +259,105 @@
       <div class="modal-actions">
         <button id="id-apply">Apply</button>
         <button id="id-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CONTROL TAB (RL policy) -->
+  <div class="tab-panel" id="tab-control">
+    <div class="ctl-estop-bar">
+      <button id="ctl-estop" class="ctl-estop">EMERGENCY STOP</button>
+      <div class="ctl-state-box">
+        <span class="ctl-state-label">State</span>
+        <span id="ctl-state" class="ctl-state">idle</span>
+        <span id="ctl-fault" class="ctl-fault"></span>
+      </div>
+    </div>
+
+    <div class="ctl-grid">
+      <div class="ctl-card">
+        <h3>Model</h3>
+        <div class="ctl-row">
+          <select id="ctl-model-select"><option value="">— no models found —</option></select>
+          <button id="ctl-load">Load</button>
+        </div>
+        <div class="ctl-meta" id="ctl-model-meta">No model loaded.</div>
+        <div class="ctl-row ctl-arm-row">
+          <button id="ctl-arm"    class="ctl-primary">Arm</button>
+          <button id="ctl-start"  class="ctl-go" disabled>Start Policy</button>
+          <button id="ctl-stop"   disabled>Stop</button>
+          <button id="ctl-disarm">Disarm</button>
+        </div>
+        <div class="ctl-row"><button id="ctl-clear" class="hidden">Clear Fault</button></div>
+        <p class="ctl-hint">Arm ramps to standing over ~2&nbsp;s with torque on. The policy
+           only runs after <em>Start</em>. After a fault, torque is cut and re-arming
+           is manual.</p>
+      </div>
+
+      <div class="ctl-card">
+        <h3>Velocity Command</h3>
+        <div class="ctl-slider">
+          <label>Forward <span id="ctl-vx-val">0.00</span> m/s</label>
+          <input type="range" id="ctl-vx" min="-0.3" max="0.5" step="0.01" value="0">
+        </div>
+        <div class="ctl-slider">
+          <label>Lateral <span id="ctl-vy-val">0.00</span> m/s</label>
+          <input type="range" id="ctl-vy" min="-0.3" max="0.3" step="0.01" value="0">
+        </div>
+        <div class="ctl-slider">
+          <label>Turn <span id="ctl-wz-val">0.00</span> rad/s</label>
+          <input type="range" id="ctl-wz" min="-0.3" max="0.3" step="0.01" value="0">
+        </div>
+        <div class="ctl-row">
+          <button id="ctl-zero-cmd">Zero Command</button>
+          <label class="ctl-check"><input type="checkbox" id="ctl-keys"> Keyboard (WASD/QE)</label>
+        </div>
+      </div>
+
+      <div class="ctl-card">
+        <h3>Loop Health</h3>
+        <div class="ctl-stat"><span>Control state</span><b id="ctl-h-state">—</b></div>
+        <div class="ctl-stat"><span>Steps</span><b id="ctl-h-steps">0</b></div>
+        <div class="ctl-stat"><span>Inference</span><b id="ctl-h-infer">— ms</b></div>
+        <div class="ctl-stat"><span>Inference max</span><b id="ctl-h-infermax">— ms</b></div>
+        <div class="ctl-stat"><span>Cycle</span><b id="ctl-h-cycle">— ms</b></div>
+        <div class="ctl-stat"><span>Budget</span><b id="ctl-h-budget">— ms</b></div>
+        <div class="ctl-stat"><span>Bus rate</span><b id="ctl-h-bus">— Hz</b></div>
+        <div class="ctl-stat"><span>Gait phase</span><b id="ctl-h-phase">—</b></div>
+      </div>
+
+      <div class="ctl-card">
+        <h3>Tilt</h3>
+        <div class="ctl-tilt-wrap">
+          <div class="ctl-tilt-bar"><div id="ctl-tilt-fill"></div><div id="ctl-tilt-limit"></div></div>
+          <div class="ctl-tilt-val"><b id="ctl-tilt">0.0</b>° / <span id="ctl-tilt-max">45</span>° limit</div>
+        </div>
+        <h3 class="ctl-sub">Safety Limits</h3>
+        <div class="ctl-slider">
+          <label>Tilt limit <span id="ctl-lim-tilt-val">45</span>°</label>
+          <input type="range" id="ctl-lim-tilt" min="15" max="60" step="1" value="45">
+        </div>
+        <div class="ctl-slider">
+          <label>Max action rate <span id="ctl-lim-rate-val">0.50</span></label>
+          <input type="range" id="ctl-lim-rate" min="0.05" max="2.0" step="0.05" value="0.5">
+        </div>
+        <div class="ctl-slider">
+          <label>Velocity scale <span id="ctl-lim-scale-val">1.00</span></label>
+          <input type="range" id="ctl-lim-scale" min="0.1" max="1.0" step="0.05" value="1.0">
+        </div>
+      </div>
+
+      <div class="ctl-card ctl-wide">
+        <h3>Joints — commanded vs measured</h3>
+        <div class="table-wrapper">
+          <table id="ctl-joint-table">
+            <thead><tr>
+              <th>Joint</th><th>Commanded °</th><th>Measured °</th>
+              <th>Error °</th><th>Action</th><th>Load %</th><th>Temp °C</th>
+            </tr></thead>
+            <tbody id="ctl-joint-tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>

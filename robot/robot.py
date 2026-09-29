@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 
@@ -273,6 +274,42 @@ class Robot:
         if not self._sim_mode:
             self._bus_manager.set_target_positions(urdf_angles, speed)
 
+    # ------------------------------------------------------------------
+    # Policy (RL) lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def policy(self):
+        """Lazily-created PolicyRunner, or None if the policy package is absent.
+
+        Lazy because onnxruntime is an optional dependency -- the server must still
+        start on a machine that only wants the servo/IK tooling. Exposed here rather
+        than letting web/ reach into hardware/ directly, per the layering rule in
+        CLAUDE.md.
+        """
+        if getattr(self, "_policy", None) is None:
+            try:
+                from policy import PolicyRunner
+            except ImportError as exc:
+                logger.info("policy package unavailable (%s); RL control disabled", exc)
+                return None
+            models_root = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
+            self._policy = PolicyRunner(self, models_root)
+        return self._policy
+
+    def attach_policy_hook(self) -> bool:
+        """Route the bus thread's per-cycle callback into the policy runner."""
+        runner = self.policy
+        if runner is None:
+            return False
+        self._bus_manager.set_policy_hook(
+            lambda bm: runner.step(bm.get_rl_state()))
+        return True
+
+    def detach_policy_hook(self) -> None:
+        self._bus_manager.set_policy_hook(None)
+
     def go_to_pose(self, pose_name: str, speed: int = 300) -> None:
         """Send robot to a named pose. Pose angles are in logical space."""
         if pose_name not in self._settings.robot.poses:
@@ -535,6 +572,16 @@ class Robot:
                     },
                 },
             }
+
+            # Policy block: only present once the package is importable, so the UI
+            # can hide the control tab entirely on a machine without onnxruntime.
+            # Guarded because a telemetry exception would kill the broadcast thread.
+            _p = getattr(self, "_policy", None)
+            if _p is not None:
+                try:
+                    frame["policy"] = _p.telemetry()
+                except Exception:
+                    logger.exception("policy telemetry failed")
 
             asyncio.run_coroutine_threadsafe(queue.put(frame), loop)
 

@@ -8,6 +8,7 @@ import { onIMUTelemetry } from './imu.js';
 import { initRobot3D, onRobotTelemetry, onFKResult } from './robot3d.js';
 import { initIdManager } from './id_manager.js';
 import { initDebug, onDebugTelemetry } from './debug.js';
+import { initControl, onControlTelemetry } from './control.js';
 
 // ── Tab routing ──────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -74,6 +75,7 @@ on('telemetry', msg => {
   onIMUTelemetry(msg.imu);
   onRobotTelemetry(msg);
   onDebugTelemetry(msg.servos);
+  onControlTelemetry(msg);
 });
 on('ik_result', msg => {
   if (!msg.success) {
@@ -105,4 +107,5 @@ initServos();
 initRobot3D();
 initIdManager();
 initDebug();
+initControl();
 connect();

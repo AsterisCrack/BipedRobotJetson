@@ -94,6 +94,35 @@ class TelemetryBroadcaster:
                 robot.go_to_pose(msg["pose"])
                 await _ack(ws, msg_type)
 
+            elif msg_type == "set_velocity_command":
+                # Continuous teleop -- comes in at slider/keyboard rate, so it goes
+                # over the socket rather than as a REST call per update. The runner
+                # clamps server-side; never trust the client for command bounds.
+                runner = robot.policy
+                if runner is None:
+                    await ws.send_text(json.dumps(
+                        {"type": "error", "message": "policy unavailable"}))
+                else:
+                    runner.set_command(
+                        float(msg.get("vx", 0.0)),
+                        float(msg.get("vy", 0.0)),
+                        float(msg.get("wz", 0.0)),
+                    )
+                    # No ack: this fires many times a second and acking each one
+                    # would flood the socket for no benefit. State arrives via
+                    # the telemetry frame.
+
+            elif msg_type == "policy_estop":
+                # Also exposed over the socket so the UI can cut torque without
+                # waiting on an HTTP round-trip.
+                runner = robot.policy
+                if runner is not None:
+                    runner.estop()
+                    robot.detach_policy_hook()
+                else:
+                    robot.disable_all_torques()
+                await _ack(ws, msg_type)
+
             elif msg_type == "set_foot_ik":
                 leg = msg["leg"]
                 x, y, z = float(msg["x"]), float(msg["y"]), float(msg["z"])
