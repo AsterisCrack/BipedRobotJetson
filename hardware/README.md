@@ -22,9 +22,59 @@ Pydantic models shared across all hardware modules.
 
 ---
 
+## Hardware Wiring (Jetson Orin Nano + Waveshare Bus Servo Adapter A)
+
+### Adapter board
+
+This project uses the [Waveshare Bus Servo Adapter (A)](https://www.waveshare.com/wiki/Bus_Servo_Adapter_(A)).
+The board handles the half-duplex single-wire servo bus protocol internally. It does **not** behave like a standard UART crossover — the UART side uses **straight-through wiring**:
+
+```
+Jetson 40-pin header          Waveshare adapter
+  Pin  8  TX  ────────────►  TX
+  Pin 10  RX  ◄────────────  RX
+  Pin  6  GND ─────────────  GND
+```
+
+> **Common mistake:** most UART connections cross TX↔RX. This board does not — TX goes to TX, RX goes to RX. Swapping them results in complete silence (no servo responses at any baud rate).
+
+Set `expect_echo: false` in `config/hardware.yaml` — the adapter handles direction control so TX bytes do not echo back on RX.
+
+### Jetson UART setup (first-time / after OS reinstall)
+
+The 40-pin header UART is **not enabled by default** on a fresh Jetson install. Without the device tree overlay the `/dev/ttyTHS1` node exists but the hardware clock is 0 — the port opens without error but transmits nothing.
+
+Enable it once via `jetson-io`:
+
+```bash
+sudo /opt/nvidia/jetson-io/jetson-io.py
+# → Configure Jetson 40pin Header
+# → Configure header pins manually
+# → Set pins 8 + 10 to "uarta"
+# → Save and reboot
+```
+
+Verify after reboot:
+
+```bash
+cat /sys/class/tty/ttyTHS1/uartclk   # should be non-zero (e.g. 51200000)
+```
+
+### Serial port permissions
+
+Add your user to `dialout` (survives reboots; takes effect next login):
+
+```bash
+sudo usermod -aG dialout $USER
+# log out and back in, then verify:
+groups | grep dialout
+```
+
+---
+
 ### `serial_bus.py` — Thread-Safe Half-Duplex UART
 
-`SerialBus` manages a single half-duplex UART where TX and RX share one wire. Every byte sent by the host appears on its own RX line (echo); the bus drains those echo bytes before reading the servo response. All transfers hold an internal `threading.Lock`.
+`SerialBus` manages the UART connection to the servo adapter. All transfers hold an internal `threading.Lock`. Echo draining (`expect_echo`) is disabled when using the Waveshare adapter since it handles bus direction control internally.
 
 ```python
 from hardware.serial_bus import SerialBus, SerialBusError

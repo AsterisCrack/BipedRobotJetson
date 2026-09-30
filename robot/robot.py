@@ -114,25 +114,24 @@ class Robot:
             self._bus.open()
         except Exception as exc:
             logger.warning("Serial bus unavailable (%s) — running without servos", exc)
-            self._bus_manager.start()
-            return
 
-        # Ping all servos (non-fatal)
-        for servo in self._servos.values():
-            if not servo.ping():
-                logger.warning("Servo %d (%s) did not respond", servo.servo_id, servo.joint_name)
+        if self._bus.is_open:
+            # Ping all servos (non-fatal)
+            for servo in self._servos.values():
+                if not servo.ping():
+                    logger.warning("Servo %d (%s) did not respond", servo.servo_id, servo.joint_name)
 
-        # Apply PID from config
-        for servo in self._servos.values():
-            try:
-                servo.apply_config_pid()
-            except SerialBusError as exc:
-                logger.warning("PID apply failed for %s: %s", servo.joint_name, exc)
+            # Apply PID from config
+            for servo in self._servos.values():
+                try:
+                    servo.apply_config_pid()
+                except SerialBusError as exc:
+                    logger.warning("PID apply failed for %s: %s", servo.joint_name, exc)
 
-        # Safety: ensure torques are disabled on startup
-        self.disable_all_torques()
+            # Safety: ensure torques are disabled on startup
+            self.disable_all_torques()
 
-        # Init IMU (non-fatal)
+        # Init IMU (non-fatal, independent of the serial bus)
         try:
             self._imu.initialize()
         except Exception as exc:
