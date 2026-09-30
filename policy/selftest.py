@@ -54,7 +54,11 @@ def main() -> int:
     ap.add_argument("--model", required=True, help="bundle name under models/")
     ap.add_argument("--synthetic", action="store_true",
                     help="use a fabricated upright state instead of real sensors")
-    ap.add_argument("--steps", type=int, default=5)
+    # 5 steps is enough for the EMA filter alone (effective alpha ~0.87/step means it
+    # tracks a FIXED target within ~5 steps), but the target itself keeps shifting as
+    # joint_pos and previous_actions evolve each step, so the whole closed loop needs
+    # more like 30 to reach a self-consistent standing pose.
+    ap.add_argument("--steps", type=int, default=30)
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -155,6 +159,16 @@ def main() -> int:
         for _ in range(cfg.action_filter_applications):
             filt = cfg.action_filter_alpha * tgt + (1 - cfg.action_filter_alpha) * filt
         ob.set_previous_action(action)
+        # Rebuild the frame for the next iteration. Torque is off, so the real joint
+        # positions genuinely do not move -- but `previous_actions` MUST reflect what
+        # we just chose, and joint_pos is fed back as the converging EMA target (`filt`)
+        # rather than the static measured position, which is what makes this a preview
+        # of "where the policy is trying to drive the robot" rather than a repeat of
+        # one stale frame. Without this rebuild, previous_actions stays at zero forever
+        # and the printed targets are the policy's response to a frame that never
+        # changes -- not a converged prediction.
+        frame = ob.build_frame(sf, gyro, pg, [0, 0, 0], filt, np.zeros(cfg.action_dim),
+                               advance_phase=False)
 
     ms = t_total / args.steps * 1000
     budget = cfg.step_dt * 1000
