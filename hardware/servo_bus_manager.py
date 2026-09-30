@@ -22,7 +22,7 @@ import logging
 import threading
 import time
 
-from hardware.imu.bno055 import BNO055, IMUReading
+from hardware.imu.bno055 import BNO055, IMUReading, _MOUNT_FLIP_YZ
 from hardware.serial_bus import SerialBus, SerialBusError
 from hardware.st3215.protocol import (
     bytes_to_steps,
@@ -254,10 +254,17 @@ class ServoBusManager:
 
         # Rotate world gravity [0,0,-1] into body frame: g_body = R_wb^T @ [0,0,-1]
         # Identity quaternion (w=1,x=y=z=0) → (0, 0, -1): upright robot, gravity straight down ✓
+        #
+        # This formula reads `imu.quaternion` directly, which -- unlike .accel/.gyro -- is NOT
+        # mount-corrected at the BNO055 source (see hardware/imu/bno055.py's _MOUNT_FLIP_YZ
+        # comment: the quaternion needs a verified composition to correct, which hasn't been
+        # done). So the result here is still in the raw sensor frame; apply the same empirically
+        # derived "negate Y, Z" mount correction to this vector directly.
         w, x, y, z = imu.quaternion
         gx =  2.0 * (w * y - x * z)
         gy = -2.0 * (y * z + w * x)
         gz =  2.0 * (x * x + y * y) - 1.0
+        gy, gz = _MOUNT_FLIP_YZ * gy, _MOUNT_FLIP_YZ * gz
 
         return {
             "positions":         positions,
