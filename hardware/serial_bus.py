@@ -151,20 +151,30 @@ class SerialBus:
             # One bulk read instead of N individual reads — eliminates N-1 syscalls.
             bulk = self._serial.read(total_rx)
             if len(bulk) < total_rx:
+                # Servos that did not reply leave gaps, so responses cannot be
+                # indexed positionally — scan for packet headers and trust the ID
+                # byte instead. Keeping the partial result means one silent servo
+                # no longer blanks the whole frame.
                 logger.debug(
                     "SYNC_READ bulk: short read — expected %d bytes, got %d; "
-                    "clearing input buffer",
+                    "parsing partial result",
                     total_rx, len(bulk),
                 )
                 self._serial.reset_input_buffer()
-                return results
 
-            for i, sid in enumerate(servo_ids):
-                chunk = bulk[i * stride : (i + 1) * stride]
+            expected = set(servo_ids)
+            i = 0
+            while i + stride <= len(bulk):
+                if bulk[i] != 0xFF or bulk[i + 1] != 0xFF or bulk[i + 2] not in expected:
+                    i += 1
+                    continue
+                sid = bulk[i + 2]
                 try:
-                    results[sid] = self._parse_chunk(chunk, data_len)
+                    results[sid] = self._parse_chunk(bulk[i : i + stride], data_len)
+                    i += stride
                 except SerialBusError as exc:
                     logger.debug("SYNC_READ: bad response from servo %d: %s", sid, exc)
+                    i += 1
 
         return results
 

@@ -131,7 +131,7 @@ class ServoBusManager:
 
         # --- shared state (bus thread writes, any thread reads) ---
         self._state_lock = threading.Lock()
-        self._servo_states: list[ServoStatus] = []
+        self._servo_states_by_id: dict[int, ServoStatus] = {}
         self._imu_state: IMUReading = IMUReading()
         self._cached_positions: dict[str, float] = {}
 
@@ -218,7 +218,8 @@ class ServoBusManager:
 
     def get_servo_states(self) -> list[ServoStatus]:
         with self._state_lock:
-            return list(self._servo_states)
+            by_id = self._servo_states_by_id
+            return [by_id[sid] for sid in self._servo_ids if sid in by_id]
 
     def get_imu_state(self) -> IMUReading:
         with self._state_lock:
@@ -242,7 +243,7 @@ class ServoBusManager:
             projected_gravity tuple[float, float, float]  world [0,0,-1] in body frame
         """
         with self._state_lock:
-            states_by_name = {s.joint_name: s for s in self._servo_states}
+            states_by_name = {s.joint_name: s for s in self._servo_states_by_id.values()}
             imu = self._imu_state
 
         positions:  list[float] = []
@@ -423,7 +424,7 @@ class ServoBusManager:
             # --- Pace to target Hz ---
             elapsed = (t_work_done - t_cycle_start) / 1e9
             sleep_for = _PERIOD - elapsed
-            if sleep_for > 0.001:
+            if sleep_for > 0.0001:
                 time.sleep(sleep_for)
 
             if p:
@@ -526,8 +527,10 @@ class ServoBusManager:
         self, servo_states: dict[int, ServoStatus], imu: IMUReading
     ) -> None:
         with self._state_lock:
-            if servo_states:
-                self._servo_states = list(servo_states.values())
-                for status in servo_states.values():
-                    self._cached_positions[status.joint_name] = status.position_deg
+            # Merge rather than replace: a cycle where some servos did not reply
+            # must not drop them from the reported state, or they flicker in and
+            # out of telemetry instead of holding their last known value.
+            for status in servo_states.values():
+                self._servo_states_by_id[status.servo_id] = status
+                self._cached_positions[status.joint_name] = status.position_deg
             self._imu_state = imu
