@@ -14,6 +14,34 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# --- Mounting correction ----------------------------------------------------
+# This robot's BNO055 is physically mounted rotated 180 deg about the body's
+# forward (X) axis relative to the URDF/policy convention (X forward, Y left,
+# Z up, identity == chip axes == body axes). That rotation is R = diag(1,-1,-1),
+# which for any body-frame vector is just "negate Y and Z" -- so no matrix
+# multiply is needed, just this sign.
+#
+# Derived and verified empirically (2026-09-30) from three static poses read via
+# get_rl_state()'s projected_gravity, torque off:
+#   level          raw=[+0.063,-0.007,+0.998]  expected ~[0,0,-1]
+#   ~45 deg fwd    raw=[+0.599,-0.036,+0.800]  expected ~[+sinθ,0,-cosθ]
+#   ~45 deg side   raw=[+0.021,+0.587,+0.809]  expected ~[0,-sinφ,-cosφ]
+# Negating Y,Z on each brings all three to within a few degrees of the expected
+# physical pattern (see policy/selftest.py output from that session for the
+# full numbers). A 180 deg board mount is the only single rigid rotation that
+# flips the sign of Z while leaving X unchanged, which is what these three
+# readings show.
+#
+# Applied to accel and gyro here (both are raw vector reads, independent of the
+# quaternion). NOT applied to `quaternion`/`euler_deg` below -- those come from
+# on-chip fusion and correcting them needs a verified quaternion composition,
+# which nobody has derived/tested yet (doing it wrong would be worse than
+# leaving it alone, since it's silent). So the IMU tab's orientation display
+# still reflects the RAW sensor frame, while accel/gyro (and, via
+# ServoBusManager.get_rl_state()'s own Y/Z negation, projected_gravity) are
+# correct body-frame values. Everything the RL policy consumes is corrected.
+_MOUNT_FLIP_YZ = -1.0
+
 
 @dataclass
 class IMUReading:
@@ -113,6 +141,7 @@ class BNO055:
             gx = _s16(bulk[0], bulk[1]) * self._GYRO_SCALE
             gy = _s16(bulk[2], bulk[3]) * self._GYRO_SCALE
             gz = _s16(bulk[4], bulk[5]) * self._GYRO_SCALE
+            gy, gz = _MOUNT_FLIP_YZ * gy, _MOUNT_FLIP_YZ * gz
 
             # Euler: offsets 6–11 (not used directly — compute from quat for consistency)
 
@@ -127,6 +156,7 @@ class BNO055:
             ax = _s16(bulk[20], bulk[21]) * self._LIA_SCALE
             ay = _s16(bulk[22], bulk[23]) * self._LIA_SCALE
             az = _s16(bulk[24], bulk[25]) * self._LIA_SCALE
+            ay, az = _MOUNT_FLIP_YZ * ay, _MOUNT_FLIP_YZ * az
 
             # Calibration status — read once every _CALIB_READ_EVERY calls (~1 Hz at 50 Hz)
             self._calib_counter = (self._calib_counter + 1) % self._CALIB_READ_EVERY

@@ -174,6 +174,26 @@ decimation loop, so effective α is `1 − 0.6⁴ = 0.87`, not 0.4.
 **Joint velocity is finite-differenced**, not read from the servo. The speed register is
 uncalibrated raw counts and reads zero under `BIPED_FAST_MODE`.
 
+### IMU mounting correction — settled, do not re-derive
+
+This robot's BNO055 is physically mounted rotated **180° about the body's forward (X) axis**
+relative to the URDF/policy convention (identity == chip axes == body axes: X forward, Y left,
+Z up). Confirmed empirically 2026-09-30 from three static `projected_gravity` readings (level,
+~45° forward tilt, ~45° side tilt, torque off) — all three matched the expected physical
+pattern only after negating Y and Z. See `hardware/imu/bno055.py`'s `_MOUNT_FLIP_YZ` comment
+for the numbers.
+
+Fixed at the source: `accel`/`gyro` are corrected in `bno055.py::read()`;
+`projected_gravity` (derived independently from the quaternion) is corrected in
+`ServoBusManager.get_rl_state()`. **The raw `quaternion`/`euler_deg` fields are NOT
+corrected** — that needs a verified quaternion composition, and nobody has captured a raw
+quaternion sample to verify one against yet. The IMU tab's orientation readout therefore still
+reflects the raw sensor frame; everything the RL policy consumes (accel, gyro,
+projected_gravity) is correct.
+
+If the IMU is ever re-mounted, re-derive this with `policy.selftest`'s live `projected_gravity`
+output at those same three poses before trusting anything past it.
+
 ### Calibration prerequisite
 
 Isaac's standing pose is URDF zero (`default_joint_pos` is all zeros). `config/robot.yaml`
