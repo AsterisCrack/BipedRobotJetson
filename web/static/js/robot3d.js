@@ -1,6 +1,13 @@
 /**
  * robot3d.js — Three.js URDF viewer, IK sliders, merged FK sliders,
  * servo config panel (direction sign + set-default), and pose buttons.
+ *
+ * The viewer doubles as the sign-convention oracle for the RL policy: the model
+ * is the real URDF parsed by urdf-loader (so every joint <axis> is applied as
+ * declared, not hand-tuned to look right) and it is driven by `logical_deg`,
+ * which is the same quantity Isaac trains on. If the model and the physical
+ * robot disagree about which way a joint moved, the servo's direction_sign is
+ * wrong relative to what the policy expects.
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -13,16 +20,51 @@ const RIGHT_JOINTS = ['r_hip_yaw','r_hip_roll_joint','r_hip_pitch_joint','r_knee
 
 const IK_RANGE    = [-0.3, 0.3];   // all position axes, metres
 const IK_DEFAULTS = { left: { x: 0, y: 0.021, z: -0.28 }, right: { x: 0, y: -0.021, z: -0.28 } };
+// Slider ranges, in LOGICAL degrees. These mirror _JOINT_LIMITS_DEG in the
+// training repo (envs/assets/robotV2/biped_robot.py) — i.e. the exact range the
+// policy's action maps onto — so dragging a slider covers the same span the
+// policy can command and nothing more. The URDF's own <limit> tags are symmetric
+// placeholders (knee reads ±120°) and do NOT describe the real mechanism, so
+// they are deliberately not used here.
 const JOINT_LIMITS = {
   l_hip_yaw:          [-45,  45],  r_hip_yaw:          [-45,  45],
-  l_hip_roll_joint:   [-25,  90],  r_hip_roll_joint:   [-25,  90],
-  l_hip_pitch_joint:  [-90,  90],  r_hip_pitch_joint:  [-90,  90],
-  l_knee_joint:       [-120,120],  r_knee_joint:       [-120,120],
-  l_ankle_roll_joint: [-80,  80],  r_ankle_roll_joint: [-80,  80],
-  l_ankle_pitch_joint:[-35,  85],  r_ankle_pitch_joint:[-35,  85],
+  l_hip_roll_joint:   [-25,  45],  r_hip_roll_joint:   [-25,  45],
+  l_hip_pitch_joint:  [-90,  30],  r_hip_pitch_joint:  [-90,  30],
+  l_knee_joint:       [-120,  5],  r_knee_joint:       [-120,  5],
+  l_ankle_roll_joint: [-60,  60],  r_ankle_roll_joint: [-60,  60],
+  l_ankle_pitch_joint:[-35,  50],  r_ankle_pitch_joint:[-35,  50],
 };
 
-let robot3d = null;
+// ── IMU visualisation ─────────────────────────────────────────────────────────
+
+// Arrow length per unit of sensor reading, and the cap so a hard knock doesn't
+// draw an arrow off-screen. The robot is ~0.3 m tall, so 10 m/s² -> 0.15 m puts
+// a decent shove at about half body height.
+const ACCEL_SCALE    = 0.015;   // m per m/s²
+const GYRO_SCALE     = 0.030;   // m per rad/s
+const ARROW_MAX      = 0.30;    // m
+const ACCEL_DEADZONE = 0.15;    // m/s² — below this the arrow hides instead of jittering
+const GYRO_DEADZONE  = 0.08;    // rad/s
+
+const AXIS_COLORS  = [0xff4444, 0x44cc44, 0x4488ff];   // X red, Y green, Z blue (matches legend)
+const AXIS_VECTORS = [
+  new THREE.Vector3(1, 0, 0),
+  new THREE.Vector3(0, 1, 0),
+  new THREE.Vector3(0, 0, 1),
+];
+
+// Arrow triad origins, in URDF body frame (Z up). Stacked above base_link so
+// they read as "on top of the robot" and don't tangle with the AxesHelper.
+const ACCEL_ORIGIN_Z = 0.08;
+const GYRO_ORIGIN_Z  = 0.15;
+
+let robot3d    = null;   // the URDF model
+let bodyFrame  = null;   // Group carrying the IMU orientation; children are body-frame
+let hudEl      = null;
+let accelArrows = [];
+let gyroArrows  = [];
+
+const _opts = { follow: true, accel: true, gyro: false };
 
 const _ikValues = {
   left:  { ...IK_DEFAULTS.left,  roll: 0, pitch: 0, yaw: 0 },
@@ -51,6 +93,7 @@ export function initRobot3D() {
   if (fkAll)   _buildFKAll(fkAll);
   _syncIKSlidersToFK();
   if (cfgPanel || fkAll) _loadServoConfigs();
+  _wireViewerOptions();
   _initScene();
 
   if (printBtn) {
@@ -76,6 +119,102 @@ export function onRobotTelemetry(msg) {
     _livePositions.set(s.joint, s.position_deg);
     const liveEl = document.querySelector(`[data-live-for="${s.joint}"]`);
     if (liveEl) liveEl.textContent = s.position_deg.toFixed(1) + '°';
+  });
+
+  if (msg.imu) _updateIMUVisuals(msg.imu);
+}
+
+// ── IMU orientation + acceleration/gyro arrows ───────────────────────────────
+
+/**
+ * Convert the RAW BNO055 quaternion into a body-frame orientation.
+ *
+ * The board is mounted rotated 180° about the body X axis (see
+ * hardware/imu/bno055.py), so body->sensor is R_mount = diag(1,-1,-1) and
+ *   R_body->world = R_sensor->world · R_mount
+ * i.e. q_body = q_raw ⊗ q_mount with q_mount = (w=0, x=1, y=0, z=0).
+ * Expanding that product collapses to a relabelling:
+ *   (w', x', y', z') = (-x, w, z, -y)
+ *
+ * This is the composition hardware/imu/bno055.py declines to do at the source
+ * because it was never verified. It is verified now, algebraically: feeding q'
+ * through the same g_body formula ServoBusManager.get_rl_state() uses reproduces
+ * that function's output exactly, including the explicit "negate Y,Z" it applies
+ * afterwards. So this rotation and the gravity vector the policy consumes agree
+ * by construction — the HUD's `grav` row is a live check of that.
+ *
+ * THREE.Quaternion's constructor takes (x, y, z, w).
+ */
+function _mountCorrectedQuat(q) {
+  return new THREE.Quaternion(q.w, q.z, -q.y, -q.x);
+}
+
+function _makeArrowTriad(parent, originZ) {
+  return AXIS_VECTORS.map((axis, i) => {
+    const arrow = new THREE.ArrowHelper(
+      axis, new THREE.Vector3(0, 0, originZ), 0.05, AXIS_COLORS[i],
+    );
+    arrow.visible = false;
+    parent.add(arrow);
+    return arrow;
+  });
+}
+
+// Each arrow points along +axis for a positive reading and flips for a negative
+// one, so the sign is readable at a glance rather than only the magnitude.
+function _updateTriad(arrows, vec, scale, deadzone, enabled) {
+  arrows.forEach((arrow, i) => {
+    const v = vec[i];
+    if (!enabled || !Number.isFinite(v) || Math.abs(v) < deadzone) {
+      arrow.visible = false;
+      return;
+    }
+    arrow.visible = true;
+    arrow.setDirection(AXIS_VECTORS[i].clone().multiplyScalar(Math.sign(v)));
+    const len = Math.min(Math.abs(v) * scale, ARROW_MAX);
+    arrow.setLength(len, len * 0.28, len * 0.16);
+  });
+}
+
+function _updateIMUVisuals(imu) {
+  if (!bodyFrame) return;
+
+  const q = _mountCorrectedQuat(imu.quaternion);
+  if (_opts.follow) bodyFrame.quaternion.copy(q);
+  else              bodyFrame.quaternion.identity();
+
+  const a = [imu.accel.x, imu.accel.y, imu.accel.z];
+  const g = [imu.gyro.x,  imu.gyro.y,  imu.gyro.z];
+  _updateTriad(accelArrows, a, ACCEL_SCALE, ACCEL_DEADZONE, _opts.accel);
+  _updateTriad(gyroArrows,  g, GYRO_SCALE,  GYRO_DEADZONE,  _opts.gyro);
+
+  if (!hudEl) return;
+  // World-down expressed in the body frame — the same `projected_gravity` the
+  // policy sees. Upright reads [0, 0, -1].
+  const pg = new THREE.Vector3(0, 0, -1).applyQuaternion(q.clone().invert());
+  const tilt = Math.acos(Math.max(-1, Math.min(1, -pg.z))) * 180 / Math.PI;
+  hudEl.innerHTML =
+    _hudRow('grav', [pg.x, pg.y, pg.z], '') +
+    `<div class="hud-tilt${tilt > 45 ? ' hud-warn' : ''}">tilt ${tilt.toFixed(1)}°</div>` +
+    _hudRow('acc', a, 'm/s²') +
+    _hudRow('gyr', g, 'rad/s');
+}
+
+function _hudRow(label, v, unit) {
+  const c = ['ax-x', 'ax-y', 'ax-z'];
+  const cells = v.map((n, i) =>
+    `<span class="${c[i]}">${(n >= 0 ? '+' : '') + n.toFixed(2)}</span>`).join(' ');
+  return `<div><span class="hud-dim">${label}</span> ${cells} <span class="hud-dim">${unit}</span></div>`;
+}
+
+function _wireViewerOptions() {
+  [['opt-imu-follow', 'follow'],
+   ['opt-accel-arrows', 'accel'],
+   ['opt-gyro-arrows', 'gyro']].forEach(([id, key]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.checked = _opts[key];
+    el.addEventListener('change', () => { _opts[key] = el.checked; });
   });
 }
 
@@ -112,16 +251,32 @@ function _initScene() {
   controls.target.set(0, -0.1, 0);
   controls.update();
 
+  // Frame chain:
+  //   scene                          Three.js world, Y up
+  //   └─ urdfFrame  (rot.x = -90°)   URDF world, Z up
+  //      └─ bodyFrame (IMU quat)     robot body frame
+  //         └─ robot3d, axes, arrows
+  //
+  // The IMU quaternion is expressed in the Z-up URDF convention, so it has to be
+  // applied *inside* urdfFrame — hanging it off the scene root would mix the two
+  // conventions and tilt the robot about the wrong axis.
+  const urdfFrame = new THREE.Group();
+  urdfFrame.rotation.x = -Math.PI / 2;
+  scene.add(urdfFrame);
+
+  bodyFrame = new THREE.Group();
+  urdfFrame.add(bodyFrame);
+
+  // Axes in base_link (URDF) frame: X=red, Y=green, Z=blue.
+  bodyFrame.add(new THREE.AxesHelper(0.12));
+  accelArrows = _makeArrowTriad(bodyFrame, ACCEL_ORIGIN_Z);
+  gyroArrows  = _makeArrowTriad(bodyFrame, GYRO_ORIGIN_Z);
+
   const loader = new URDFLoader();
   loader.packages = { RobotDescription: '/robot_description' };
   loader.load('/robot_description/urdf/robot_flat.urdf', obj => {
     robot3d = obj;
-    robot3d.rotation.x = -Math.PI / 2;
-    scene.add(robot3d);
-    // Axes in base_link (URDF) frame: X=red, Y=green, Z=blue.
-    // Added as a child so the -π/2 rotation carries the axes into world space
-    // with the correct URDF orientation.
-    robot3d.add(new THREE.AxesHelper(0.12));
+    bodyFrame.add(robot3d);
   });
 
   // Legend overlay — explains axis colours in the viewer corner.
@@ -130,8 +285,13 @@ function _initScene() {
   legend.innerHTML =
     '<span class="ax-x">X</span> forward &nbsp;' +
     '<span class="ax-y">Y</span> lateral &nbsp;' +
-    '<span class="ax-z">Z</span> up';
+    '<span class="ax-z">Z</span> up<br>' +
+    '<span class="hud-dim">lower triad = accel · upper = gyro</span>';
   container.appendChild(legend);
+
+  hudEl = document.createElement('div');
+  hudEl.className = 'viewer-hud';
+  container.appendChild(hudEl);
 
   new ResizeObserver(() => {
     const nw = container.clientWidth, nh = container.clientHeight;

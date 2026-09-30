@@ -213,6 +213,28 @@ tbody td { padding: .4rem .6rem; vertical-align: middle; }
 .ax-y { color: #44cc44; font-weight: 700; }
 .ax-z { color: #4488ff; font-weight: 700; }
 
+/* Live IMU readout, top-left of the viewer. Monospace + tabular numbers so the
+   columns don't shuffle as signs and digits change at 20 Hz. */
+.viewer-hud {
+  position: absolute; top: 0.5rem; left: 0.5rem;
+  background: rgba(13, 13, 26, 0.75);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 0.35rem 0.6rem; font-size: 0.72rem; line-height: 1.6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none; color: var(--text-dim);
+}
+.hud-dim  { color: var(--text-dim); opacity: 0.7; }
+.hud-tilt { color: var(--text-dim); }
+.hud-warn { color: #ff4444; font-weight: 700; }
+
+.opt-row {
+  display: flex; align-items: center; gap: 0.45rem;
+  font-size: 0.8rem; color: var(--text-dim); cursor: pointer;
+  padding: 0.15rem 0;
+}
+.opt-row input { cursor: pointer; }
+
 .robot-controls {
   width: 300px; flex-shrink: 0; overflow-y: auto;
   display: flex; flex-direction: column; gap: .6rem;
