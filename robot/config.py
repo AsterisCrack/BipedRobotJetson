@@ -25,9 +25,12 @@ class Settings(BaseSettings):
 
     # Bus manager tuning — set in .env to override defaults.
     # BIPED_RT_SCHEDULING=1  → SCHED_FIFO for bus thread (needs CAP_SYS_NICE or root)
-    # BIPED_FAST_MODE=1      → position-only SYNC_READ (no speed/load/voltage/temp)
+    # BIPED_FAST_MODE        → how much of the status block SYNC_READ pulls per servo:
+    #   0 = pos, speed, load, voltage, temp   (8 B — everything the web UI shows)
+    #   1 = pos                               (2 B — fastest; no velocity, so no policy)
+    #   2 = pos, speed                        (4 B — what the RL policy needs)
     biped_rt_scheduling: bool = False
-    biped_fast_mode: bool = False
+    biped_fast_mode: int = Field(default=0, ge=0, le=2)
 
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     robot: RobotConfig = Field(default_factory=RobotConfig)

@@ -64,8 +64,6 @@ class PolicyRunner:
 
         self._command = np.zeros(3, dtype=np.float64)
         self._filtered_targets: np.ndarray | None = None  # radians, policy order
-        self._prev_positions_rad: np.ndarray | None = None
-        self._prev_pos_time: float | None = None
         self._arm_start: np.ndarray | None = None
 
         # Diagnostics
@@ -142,6 +140,13 @@ class PolicyRunner:
                 raise RuntimeError("no model loaded")
             if not self.sm.can(PolicyState.ARMING):
                 raise RuntimeError(f"cannot arm from {self.sm.state.value}")
+            if not self._robot._bus_manager.has_velocity:
+                # Without the speed bytes obs[24:36] would be all zeros -- in-range,
+                # plausible, and wrong. Refuse rather than walk on it.
+                raise RuntimeError(
+                    "BIPED_FAST_MODE=1 omits the speed register, so the policy's joint_vel "
+                    "channel would be silently zero. Use BIPED_FAST_MODE=2 (pos+speed) or 0."
+                )
 
             self.safety.reset()
             self._command[:] = 0.0
@@ -171,8 +176,6 @@ class PolicyRunner:
 
             pos_rad = self._mapper.robot_deg_to_policy_rad(rl["positions"])
             self._filtered_targets = pos_rad.copy()   # matches Isaac's reset behaviour
-            self._prev_positions_rad = pos_rad.copy()
-            self._prev_pos_time = time.monotonic()
             self._command[:] = 0.0
             self.safety.reset()
 
@@ -342,17 +345,7 @@ class PolicyRunner:
 
         pos_rad = self._mapper.robot_deg_to_policy_rad(rl_state["positions"])
 
-        # Finite-difference velocity. The servo's own speed register is in
-        # uncalibrated raw counts and reads zero under BIPED_FAST_MODE, so it is not
-        # usable as rad/s without a bench calibration we have not done.
-        now = time.monotonic()
-        if self._prev_positions_rad is None or self._prev_pos_time is None:
-            vel_rad = np.zeros_like(pos_rad)
-        else:
-            dt = max(now - self._prev_pos_time, 1e-3)
-            vel_rad = (pos_rad - self._prev_positions_rad) / dt
-        self._prev_positions_rad = pos_rad.copy()
-        self._prev_pos_time = now
+        vel_rad = self._mapper.robot_rate_to_policy_rad(rl_state["velocities_deg_s"])
 
         return self._obs.build_frame(
             specific_force_b=spec_force,

@@ -154,7 +154,7 @@ I2C_BUS=7                # 40-pin header I2C on Jetson Orin Nano
 
 # Bus tuning (see "Bus Performance" section below)
 BIPED_RT_SCHEDULING=1    # SCHED_FIFO for the servo bus thread (reduces jitter)
-BIPED_FAST_MODE=1        # Position-only reads — saves 720 µs per cycle
+BIPED_FAST_MODE=2        # 0=full status, 1=position only, 2=position+speed (RL policy)
 
 # Debug
 BIPED_DEBUG=1            # DEBUG-level logs for kinematics/ and robot/
@@ -250,7 +250,7 @@ poses:
 A live table of all 12 servos updated at 20 Hz showing:
 
 - **Position °** — current angle with an interactive drag slider; dragging sends a `set_position` command in real time
-- **Speed** — current velocity in steps/s
+- **Speed** — current velocity in steps/s, signed (1 step/s = 0.088 °/s)
 - **Load %** — motor output load (0–100%)
 - **Voltage V** — supply voltage (turns orange/red near limits)
 - **Temp °C** — internal temperature (turns orange/red near limits)
@@ -545,7 +545,7 @@ zero-padded. Nothing moves autonomously.
 | Joint order | interleaved L/R | per-leg (all left, then all right) — permuted **by name**, never by index |
 | IMU accel | specific force, gravity included (~+9.81 z upright) | BNO055 `linear_accel` is gravity-*removed* — reconstructed as `linear_accel − 9.81 × projected_gravity` |
 | Action smoothing | EMA applied 4× per control step (decimation) | replicated as 4 applications, not 1 — applying once leaves the robot measurably laggier |
-| Joint velocity | rad/s | servo speed register is uncalibrated raw counts, reads 0 under `BIPED_FAST_MODE` — finite-differenced from position instead |
+| Joint velocity | rad/s | servo `CURRENT_SPEED` register, in steps/s — **sign-magnitude, bit 15 = direction** (decode with `unpack_sign_magnitude16`, not as unsigned), then `direction_sign` applied. Needs `BIPED_FAST_MODE` 0 or 2; the policy refuses to arm under 1 |
 
 ---
 
@@ -606,7 +606,15 @@ sudo setcap cap_sys_nice+eip $(readlink -f venv/bin/python3)
 
 Note: `setcap` is silently ignored on `nosuid` filesystems (getcap will still show it; use `findmnt -T venv/bin/python3` to check). Running as root bypasses this.
 
-**`BIPED_FAST_MODE=1`** — SYNC_READ fetches only position (2 bytes/servo) instead of the full 8-byte status block. Saves 720 µs of pure UART time per cycle. Side effect: speed, load, voltage, and temperature read as 0 in telemetry.
+**`BIPED_FAST_MODE`** — how many bytes SYNC_READ pulls per servo from the status block at `0x38`. The registers are contiguous, so a shorter read is just a prefix; whatever is skipped reads as 0. UART time is at 1 Mbps over 12 servos, against a 20 ms cycle.
+
+| Mode | Bytes/servo | Fields | UART | vs mode 0 |
+|---|---|---|---|---|
+| `0` (default) | 8 | pos, speed, load, voltage, temp | 1680 µs | — |
+| `1` | 2 | pos | 960 µs | −720 µs |
+| `2` | 4 | pos, speed | 1200 µs | −480 µs |
+
+**Mode 2 is the one to use when running the policy**: it keeps joint velocity and still drops two thirds of what mode 1 saves. Mode 1 is incompatible with the policy — `PolicyRunner.arm()` and `policy.selftest` both refuse to start under it, because a zero joint_vel channel is in-range and plausible rather than obviously broken. Modes 1 and 2 both blank the load/voltage/temperature columns in the web UI.
 
 ---
 

@@ -57,9 +57,12 @@ class Reg:
     MOVE_FLAG        = 0x42
     CURRENT_CURRENT_L= 0x45   # 2 bytes, unit: 6.5 mA
 
-    # Bulk status read: 8 bytes from 0x38 → pos, speed, load
+    # Bulk status read. These registers are contiguous from 0x38, so a shorter read is
+    # just a prefix of the full one — see BIPED_FAST_MODE for the three widths.
     STATUS_START     = 0x38
     STATUS_LEN       = 8      # pos(2) + speed(2) + load(2) + voltage(1) + temp(1)
+    STATUS_LEN_POS_SPEED = 4  # pos(2) + speed(2) — everything the RL policy reads
+    STATUS_LEN_POS   = 2      # pos(2)
 
 
 class Instr:

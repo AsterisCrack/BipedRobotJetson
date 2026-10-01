@@ -12,7 +12,7 @@ from hardware.st3215.protocol import (
     encode_write,
     pack_u16,
     steps_to_bytes,
-    unpack_u16,
+    unpack_sign_magnitude16,
 )
 from hardware.st3215.registers import Reg
 
@@ -96,6 +96,12 @@ class ST3215:
         if self._cfg.direction_sign == 0:
             return 0.0
         return (steps - self._cfg.zero_offset_steps) / (STEPS_PER_DEG * self._cfg.direction_sign)
+
+    def steps_per_s_to_deg_per_s(self, steps_per_s: int) -> float:
+        """Servo speed counts -> URDF deg/s. Same as steps_to_deg minus the zero offset."""
+        if self._cfg.direction_sign == 0:
+            return 0.0
+        return steps_per_s / (STEPS_PER_DEG * self._cfg.direction_sign)
 
     # ------------------------------------------------------------------
     # Raw register I/O
@@ -194,8 +200,8 @@ class ST3215:
         # Read 8 bytes starting at 0x38: pos(2) speed(2) load(2) voltage(1) temp(1)
         data = self.read_register(Reg.STATUS_START, Reg.STATUS_LEN)
         pos_steps = bytes_to_steps(data, 0)
-        speed = unpack_u16(data, 2)
-        load = unpack_u16(data, 4)
+        speed = unpack_sign_magnitude16(data, 2)
+        load = unpack_sign_magnitude16(data, 4)
         voltage_raw = data[6]
         temp = data[7]
         return ServoStatus(

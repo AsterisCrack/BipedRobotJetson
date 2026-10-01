@@ -76,7 +76,7 @@ The IMU runs in its own daemon thread (`_IMUReaderThread`) that reads BNO055 con
 External code never touches the bus directly for position I/O. Interaction is non-blocking:
 - **Write**: `bus_manager.set_target_positions(urdf_angles, speed)` — merges into pending dict (latest-wins per joint)
 - **Read**: `bus_manager.get_servo_states()` / `get_cached_positions()` / `get_imu_state()` — returns a copy of the last state
-- **RL**: `bus_manager.get_rl_state()` — one-shot dict with positions, velocities, linear_accel, angular_vel, projected_gravity
+- **RL**: `bus_manager.get_rl_state()` — one-shot dict with positions, velocities, velocities_deg_s, linear_accel, angular_vel, projected_gravity
 
 The bus lock in `SerialBus` still protects infrequent direct bus calls (ping, PID write, torque toggle, scan) from racing with the manager thread.
 
@@ -171,8 +171,19 @@ it as `linear_accel − 9.81 × projected_gravity`.
 **The EMA filter runs 4× per control step**, not once — Isaac applies it inside its
 decimation loop, so effective α is `1 − 0.6⁴ = 0.87`, not 0.4.
 
-**Joint velocity is finite-differenced**, not read from the servo. The speed register is
-uncalibrated raw counts and reads zero under `BIPED_FAST_MODE`.
+**Joint velocity comes from the servo's speed register** (`CURRENT_SPEED`, 0x3A), in steps/s —
+1 LSB = 0.00153 rad/s, ~50× finer than differencing position at 50 Hz. Two traps:
+
+- It is **sign-magnitude, bit 15 = direction**, not two's complement. Decode with
+  `unpack_sign_magnitude16`, matching Feetech's own `sts_tohost(v, 15)`. Reading it unsigned
+  turns −100 steps/s into +50.4 rad/s. `CURRENT_LOAD` has the same encoding.
+- `direction_sign` must be applied, exactly as `steps_to_deg` does for position. Use
+  `get_rl_state()["velocities_deg_s"]`, which has already done both.
+
+Needs `BIPED_FAST_MODE` 0 or 2 — mode 1 omits the speed bytes, so the channel would read a
+silent, plausible zero. `PolicyRunner.arm()` and `policy.selftest` both refuse to run under it
+(check `ServoBusManager.has_velocity`, don't compare the mode integer). **Mode 2 is the one to
+run the policy under**: pos+speed only, 480 µs/cycle cheaper than the full status block.
 
 ### IMU mounting correction — settled, do not re-derive
 
@@ -209,7 +220,8 @@ Use `get_rl_state()` for a single-call observation snapshot:
 obs = bus_manager.get_rl_state()
 # obs keys:
 #   positions         list[float]               servo deg in config order (URDF space)
-#   velocities        list[int]                 servo speed counts (0 in BIPED_FAST_MODE)
+#   velocities        list[int]                 signed speed counts (0 if BIPED_FAST_MODE=1)
+#   velocities_deg_s  list[float]               URDF deg/s — what the policy wants
 #   linear_accel      tuple[float, float, float] body-frame m/s²
 #   angular_vel       tuple[float, float, float] body-frame rad/s
 #   projected_gravity tuple[float, float, float] world [0,0,-1] rotated into body frame
