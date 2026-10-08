@@ -26,6 +26,7 @@
       <button class="tab-btn" data-tab="robot">Robot</button>
       <button class="tab-btn" data-tab="debug">Debug</button>
       <button class="tab-btn" data-tab="control">Control</button>
+      <button class="tab-btn" data-tab="sysid">SysID</button>
     </nav>
     <button id="btn-sim-mode" class="sim-btn" title="Toggle simulation mode — suppresses all physical servo writes">Sim Mode: OFF</button>
     <div class="ws-status" id="ws-status">Connecting…</div>
@@ -374,6 +375,91 @@
             <tbody id="ctl-joint-tbody"></tbody>
           </table>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SYSID TAB (servo identification for the BAM model; see robot/sysid.py) -->
+  <div class="tab-panel" id="tab-sysid">
+    <div class="ctl-estop-bar">
+      <button id="sid-abort" class="ctl-estop">ABORT (torque off)</button>
+      <div class="ctl-state-box">
+        <span class="ctl-state-label">State</span>
+        <span id="sid-state" class="ctl-state">idle</span>
+        <span id="sid-error" class="ctl-fault"></span>
+      </div>
+    </div>
+
+    <div class="ctl-grid">
+      <div class="ctl-card">
+        <h3>1 · Rig</h3>
+        <div class="ctl-meta" id="sid-rig-meta">Loading…</div>
+        <table class="sid-small"><thead><tr>
+          <th>Hole</th><th>r (mm)</th><th>mass (kg)</th><th>L (mm)</th><th>static τ (N·m)</th>
+        </tr></thead><tbody id="sid-rig-tbody"></tbody></table>
+      </div>
+
+      <div class="ctl-card">
+        <h3>2 · Session</h3>
+        <div class="ctl-meta">One session = one mounting of one servo. Never remount mid-session
+          (BAM fits a single offset across all of it).</div>
+        <div class="ctl-row">
+          <input id="sid-session-name" placeholder="session name, e.g. bench_servo1" />
+          <input id="sid-servo-id" type="number" min="1" max="253" value="1" class="sid-num" title="servo id" />
+          <button id="sid-start-session">Start</button>
+        </div>
+        <div class="ctl-row">
+          <button id="sid-zero">Capture hanging zero</button>
+          <span class="ctl-meta" id="sid-zero-meta">Torque goes off; let the arm hang still.</span>
+        </div>
+      </div>
+
+      <div class="ctl-card">
+        <h3>3 · Record <span class="sid-warn">bench only: swings ±90°</span></h3>
+        <div class="ctl-row">
+          <select id="sid-traj"></select>
+          <select id="sid-kp"></select>
+          <select id="sid-hole"></select>
+        </div>
+        <div class="ctl-row">
+          <label class="sid-check"><input type="checkbox" id="sid-force" />
+            servo id is a robot joint but it IS on the rig</label>
+        </div>
+        <div class="ctl-row">
+          <button id="sid-run" class="ctl-go">Record 6 s</button>
+          <span class="ctl-meta" id="sid-run-meta"></span>
+        </div>
+      </div>
+
+      <div class="ctl-card ctl-wide">
+        <h3>Live — goal vs measured position</h3>
+        <canvas id="sid-plot" width="960" height="240"></canvas>
+        <div class="ctl-meta"><span class="sid-key sid-goal"></span>goal
+          <span class="sid-key sid-pos"></span>measured
+          <span class="sid-key sid-off"></span>torque off</div>
+      </div>
+
+      <div class="ctl-card">
+        <h3>4 · Recordings</h3>
+        <div class="ctl-meta" id="sid-coverage"></div>
+        <div id="sid-grid" class="sid-grid"></div>
+        <div class="ctl-row"><a id="sid-download" class="sid-link" href="/api/sysid/download">Download session (.zip)</a></div>
+        <ul id="sid-files" class="sid-files"></ul>
+      </div>
+
+      <div class="ctl-card">
+        <h3>5 · In-situ screen <span class="sid-warn">robot suspended, legs free</span></h3>
+        <div class="ctl-meta">Small triangle on each joint in turn. Hysteresis = backlash + friction
+          deadband; it sets the training DR ranges (config.yaml backlash.lash_deg_range).</div>
+        <div class="ctl-row">
+          <label>±deg <input id="sid-scr-amp" type="number" value="10" min="1" max="20" class="sid-num" /></label>
+          <label>period s <input id="sid-scr-period" type="number" value="6" min="2" max="20" class="sid-num" /></label>
+          <label>cycles <input id="sid-scr-cycles" type="number" value="2" min="1" max="5" class="sid-num" /></label>
+          <button id="sid-screen">Screen all joints</button>
+        </div>
+        <table class="sid-small"><thead><tr>
+          <th>Joint</th><th>Hysteresis °</th><th>Lag ↑ °</th><th>Lag ↓ °</th><th>Hz</th>
+        </tr></thead><tbody id="sid-screen-tbody"></tbody></table>
       </div>
     </div>
   </div>

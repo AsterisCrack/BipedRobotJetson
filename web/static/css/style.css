@@ -414,3 +414,22 @@ tbody td { padding: .4rem .6rem; vertical-align: middle; }
 #ctl-joint-table td, #ctl-joint-table th { padding: .3rem .5rem; text-align: right; }
 #ctl-joint-table td:first-child, #ctl-joint-table th:first-child { text-align: left; }
 .ctl-warn { color: var(--warning); font-weight: 600; }
+
+/* === SysID tab (reuses .ctl-* cards; these are the extras) === */
+.sid-small { width: 100%; font-variant-numeric: tabular-nums; margin-top: .4rem; }
+.sid-small td, .sid-small th { padding: .25rem .45rem; text-align: right; }
+.sid-small td:first-child, .sid-small th:first-child { text-align: left; }
+.sid-num { width: 4.5rem; }
+.sid-warn { color: var(--warning); font-size: .75rem; font-weight: 400; margin-left: .4rem; }
+.sid-check { color: var(--text-dim); font-size: .8rem; display: flex; gap: .4rem; align-items: center; }
+#sid-plot { width: 100%; height: auto; background: #0d0d1a; border: 1px solid var(--border); border-radius: var(--radius); }
+.sid-key { display: inline-block; width: .9rem; height: .2rem; margin: 0 .3rem 0 .8rem; vertical-align: middle; }
+.sid-key.sid-goal { background: var(--accent); }
+.sid-key.sid-pos  { background: var(--success); }
+.sid-key.sid-off  { background: rgba(255, 90, 90, .35); height: .7rem; }
+.sid-grid { display: grid; gap: .25rem; font-size: .72rem; margin: .4rem 0 .6rem; }
+.sid-grid span { padding: .2rem .3rem; border-radius: 3px; background: var(--surface2); color: var(--text-dim); text-align: center; }
+.sid-grid span.done { background: rgba(80, 200, 120, .25); color: var(--text); }
+.sid-grid span.head { background: none; color: var(--text-dim); font-weight: 600; }
+.sid-files { max-height: 10rem; overflow-y: auto; font-size: .75rem; color: var(--text-dim); padding-left: 1rem; }
+.sid-link { color: var(--accent); font-size: .85rem; }

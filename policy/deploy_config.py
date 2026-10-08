@@ -54,6 +54,12 @@ class DeployConfig:
 
     command_ranges: dict
     tilt_fault_rad: float
+    # "absolute" (format v1, e.g. walk_v1) or "centered" (v2+). See action_to_joint_targets.
+    action_map: str = "absolute"
+    # Servo model the policy was trained against (v2+), e.g. {"model": "bam", "kp_fw": 32,
+    # "requires_pid": {"p": 32, "d": 0, "i": 0}, ...}. None for v1 bundles.
+    actuator: dict | None = None
+    format_version: int = 1
     info: dict = field(default_factory=dict)
 
     @property
@@ -72,10 +78,16 @@ class DeployConfig:
     def action_to_joint_targets(self, action: np.ndarray) -> np.ndarray:
         """[-1,1] -> joint position targets in radians (logical space).
 
-        Affine onto the FULL joint-limit box, matching biped_env._pre_physics_step.
-        Note this means action 0 maps to the limit MIDPOINT, not the neutral pose.
+        Must match BipedEnv.actions_to_targets for the bundle's action_map exactly:
+          absolute  affine onto the full joint-limit box, so a = 0 is the limit MIDPOINT
+          centered  a = 0 is the default pose and a = +-1 reach each limit, piecewise
+                    linear on either side
         """
         a = np.clip(action, -1.0, 1.0)
+        if self.action_map == "centered":
+            span = np.where(a >= 0.0, self.joint_limits_max - self.default_joint_pos,
+                            self.default_joint_pos - self.joint_limits_min)
+            return self.default_joint_pos + a * span
         return self.joint_limits_min + (a + 1.0) * 0.5 * self.joint_range
 
 
@@ -128,6 +140,18 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     if np.any(hi <= lo):
         raise ValueError("joint_limits_max must exceed joint_limits_min for every joint")
 
+    # Format v2 added the action map and servo model. Refuse anything newer than we
+    # understand: a runtime that guesses the map would mis-execute every action.
+    fmt = int(raw.get("format_version", 1))
+    if fmt > 2:
+        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (2)")
+    action_map = raw.get("action_map", "absolute" if fmt == 1 else None)
+    if action_map not in ("absolute", "centered"):
+        raise ValueError(f"unknown or missing action_map {action_map!r} (format v{fmt})")
+    default_pos = np.asarray(raw.get("default_joint_pos", [0.0] * action_dim), dtype=np.float64)
+    if action_map == "centered" and (np.any(default_pos >= hi) or np.any(default_pos <= lo)):
+        raise ValueError("centered action map needs every default_joint_pos strictly inside its limits")
+
     eps = float(raw["obs_epsilon"])
     applications = int(raw["action_filter_applications_per_step"])
     if applications < 1:
@@ -152,8 +176,7 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
         joint_limits_min=lo,
         joint_limits_max=hi,
         joint_range=hi - lo,
-        default_joint_pos=np.asarray(
-            raw.get("default_joint_pos", [0.0] * action_dim), dtype=np.float64),
+        default_joint_pos=default_pos,
         obs_mean=obs_mean,
         obs_scale=1.0 / np.sqrt(obs_var + eps),
         action_filter_alpha=float(raw["action_filter_alpha"]),
@@ -163,6 +186,9 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
         gait_clock_freq=float(raw["gait_clock_freq"]),
         command_ranges=raw.get("command_ranges", {}),
         tilt_fault_rad=float(raw.get("tilt_fault_rad", 0.784)),
+        action_map=action_map,
+        actuator=raw.get("actuator"),
+        format_version=fmt,
         info=info,
     )
 
@@ -184,6 +210,7 @@ def discover_bundles(models_root: str) -> list[dict]:
             entry.update(
                 obs_dim=cfg.obs_dim, action_dim=cfg.action_dim,
                 control_hz=cfg.control_hz, info=cfg.info,
+                action_map=cfg.action_map, actuator=cfg.actuator,
             )
         except Exception as exc:  # surface broken bundles rather than hiding them
             entry.update(valid=False, error=str(exc))

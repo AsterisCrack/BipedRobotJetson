@@ -32,6 +32,7 @@ from hardware.st3215.protocol import (
     steps_to_bytes,
     unpack_sign_magnitude16,
 )
+from hardware.st3215.servo import GOAL_BLOCK_LEN, goal_bytes
 from hardware.st3215.registers import Reg
 from hardware.st3215.servo import ST3215, ServoStatus
 
@@ -156,6 +157,10 @@ class ServoBusManager:
         # reading and its command lands on the very next SYNC_WRITE.
         self._policy_hook = None
 
+        # Exclusive job (system identification): run ON the bus thread, between normal
+        # cycles, so the bus keeps exactly one owner. Set by run_exclusive().
+        self._exclusive_job: tuple | None = None
+
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._imu_reader: _IMUReaderThread | None = None
@@ -216,6 +221,55 @@ class ServoBusManager:
         The hook is detached automatically if it raises.
         """
         self._policy_hook = hook
+
+    def run_exclusive(self, job, timeout: float | None = None):
+        """Run ``job.run(bus)`` on the bus thread and block until it finishes.
+
+        While it runs, the normal 50 Hz cycle is suspended: no SYNC_READ of all servos, no
+        policy hook, and no queued SYNC_WRITE. Commands queued during the job are DROPPED
+        when it ends, not replayed, since replaying stale targets after a sysid run would
+        jump the robot. The job owns the bus and must not touch this manager.
+
+        Raises RuntimeError if the bus thread isn't running or another job is in flight.
+        Any exception from the job is re-raised in the caller.
+        """
+        if self._thread is None or not self._thread.is_alive() or not self._bus.is_open:
+            raise RuntimeError("bus thread not running (or bus closed); cannot run an exclusive job")
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("run_exclusive called from the bus thread itself")
+        done = threading.Event()
+        box: dict = {}
+        with self._cmd_lock:
+            if self._exclusive_job is not None:
+                raise RuntimeError("another exclusive job is already running")
+            self._exclusive_job = (job, done, box)
+        if not done.wait(timeout):
+            raise TimeoutError("exclusive job did not finish in time (it is still running)")
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    @property
+    def exclusive_active(self) -> bool:
+        return self._exclusive_job is not None
+
+    def _service_exclusive(self) -> bool:
+        """Called at the top of each cycle. Returns True if a job ran (skip the cycle)."""
+        entry = self._exclusive_job
+        if entry is None:
+            return False
+        job, done, box = entry
+        try:
+            box["result"] = job.run(self._bus)
+        except BaseException as exc:          # never let a job kill the bus thread
+            logger.exception("exclusive job raised")
+            box["error"] = exc
+        finally:
+            with self._cmd_lock:
+                self._pending_positions = None     # drop commands queued during the job
+                self._exclusive_job = None
+            done.set()
+        return True
 
     def set_target_positions(
         self, joint_angles: dict[str, float], speed: int = 300
@@ -394,6 +448,8 @@ class ServoBusManager:
         p = self._profiling
 
         while not self._stop.is_set():
+            if self._service_exclusive():
+                continue
             t_cycle_start = time.monotonic_ns()
 
             if self._bus.is_open:
@@ -515,11 +571,11 @@ class ServoBusManager:
             if servo is None:
                 continue
             steps = servo.deg_to_steps(deg)
-            servo_data.append((servo.servo_id, steps_to_bytes(steps) + pack_u16(speed)))
+            servo_data.append((servo.servo_id, goal_bytes(steps, speed)))
 
         if not servo_data:
             return
-        packet = encode_sync_write(Reg.TARGET_POS_L, 4, servo_data)
+        packet = encode_sync_write(Reg.TARGET_POS_L, GOAL_BLOCK_LEN, servo_data)
         try:
             self._bus.send_no_reply(packet)
         except SerialBusError as exc:

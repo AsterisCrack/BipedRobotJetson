@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 
 STEPS_PER_DEG: float = 4096.0 / 360.0
 
+# The goal block starting at 0x2A is position(2) | TIME(2) | SPEED(2). It is NOT
+# position | speed: speed lives at 0x2E (Feetech SDK: GOAL_POSITION 42, GOAL_TIME 44,
+# GOAL_SPEED 46). Until 2026-10-02 every write here was 4 bytes, so the "speed" argument
+# landed in the goal-TIME register and goal speed was never set. Feetech's own WritePosEx
+# writes time = 0 and the speed separately, which is what goal_bytes does. speed = 0
+# means "no limit".
+GOAL_BLOCK_LEN = 6
+
+
+def goal_bytes(steps: int, speed: int = 0) -> bytes:
+    """Bytes for the 0x2A goal block: position, goal time = 0, goal speed."""
+    return steps_to_bytes(steps) + pack_u16(0) + pack_u16(speed)
+
 
 @dataclass
 class ServoStatus:
@@ -132,10 +145,7 @@ class ST3215:
     # ------------------------------------------------------------------
 
     def set_position(self, deg: float, speed: int = 0) -> None:
-        steps = self.deg_to_steps(deg)
-        data = steps_to_bytes(steps) + pack_u16(speed)
-        # Write TARGET_POS (2B) + TARGET_SPEED (2B) starting at 0x2A
-        self.write_register(Reg.TARGET_POS_L, data)
+        self.write_register(Reg.TARGET_POS_L, goal_bytes(self.deg_to_steps(deg), speed))
 
     def get_position(self) -> float:
         data = self.read_register(Reg.CURRENT_POS_L, 2)
@@ -149,8 +159,7 @@ class ST3215:
         return (steps / STEPS_PER_DEG) * 360.0
 
     def set_position_steps(self, steps: int, speed: int = 0) -> None:
-        data = steps_to_bytes(steps) + pack_u16(speed)
-        self.write_register(Reg.TARGET_POS_L, data)
+        self.write_register(Reg.TARGET_POS_L, goal_bytes(steps, speed))
 
     def set_speed(self, speed: int) -> None:
         self.write_register(Reg.TARGET_SPEED_L, pack_u16(speed))

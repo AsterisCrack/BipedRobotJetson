@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 
-from web.routers import config, imu, kinematics, policy, servos
+from web.routers import config, imu, kinematics, policy, servos, sysid
 from web.websocket import TelemetryBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ def create_app(robot) -> FastAPI:
     app.include_router(kinematics.router, prefix="/api/kinematics",  tags=["kinematics"])
     app.include_router(config.router,     prefix="/api/config",      tags=["config"])
     app.include_router(policy.router,     prefix="/api/policy",      tags=["policy"])
+    app.include_router(sysid.router,      prefix="/api/sysid",       tags=["sysid"])
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket):

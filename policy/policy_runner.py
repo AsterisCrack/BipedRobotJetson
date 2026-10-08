@@ -140,6 +140,8 @@ class PolicyRunner:
                 raise RuntimeError("no model loaded")
             if not self.sm.can(PolicyState.ARMING):
                 raise RuntimeError(f"cannot arm from {self.sm.state.value}")
+            if getattr(self._robot, "sysid_active", False):
+                raise RuntimeError("a system-identification job owns the bus; wait for it or abort it")
             if not self._robot._bus_manager.has_velocity:
                 # Without the speed bytes obs[24:36] would be all zeros -- in-range,
                 # plausible, and wrong. Refuse rather than walk on it.
@@ -147,6 +149,23 @@ class PolicyRunner:
                     "BIPED_FAST_MODE=1 omits the speed register, so the policy's joint_vel "
                     "channel would be silently zero. Use BIPED_FAST_MODE=2 (pos+speed) or 0."
                 )
+
+            # A BAM-trained policy (bundle format v2) learned against a P-ONLY firmware loop
+            # at a specific P register. Arming it on servos running D != 0 or a different P
+            # would hand it an actuator it never saw, which is the exact sim2real gap the
+            # servo model exists to close. config/robot.yaml is what Robot.initialize()
+            # writes to the servos, so check that.
+            req = ((self.cfg.actuator or {}).get("requires_pid") if self.cfg.actuator else None)
+            if req:
+                wrong = []
+                for servo in self._robot._bus_manager._servos:
+                    pid = servo._cfg.pid
+                    if (pid.p, pid.d, pid.i) != (req["p"], req["d"], req["i"]):
+                        wrong.append(f"{servo.joint_name} p/d/i={pid.p}/{pid.d}/{pid.i}")
+                if wrong:
+                    raise RuntimeError(
+                        f"bundle was trained on servos with P/D/I = {req['p']}/{req['d']}/{req['i']}, "
+                        f"but config/robot.yaml has: {', '.join(wrong)}. Fix the PID there and restart.")
 
             self.safety.reset()
             self._command[:] = 0.0

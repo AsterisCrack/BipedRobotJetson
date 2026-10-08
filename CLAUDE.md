@@ -80,6 +80,22 @@ External code never touches the bus directly for position I/O. Interaction is no
 
 The bus lock in `SerialBus` still protects infrequent direct bus calls (ping, PID write, torque toggle, scan) from racing with the manager thread.
 
+**Exclusive jobs.** `bus_manager.run_exclusive(job)` runs `job.run(bus)` *on the bus thread*
+between normal cycles, so the bus keeps a single owner. The SysID recorder uses it. While a job
+runs there is no SYNC_READ of all servos, no policy hook and no queued SYNC_WRITE, and
+commands queued meanwhile are **dropped** rather than replayed. Inside a job, never use
+`transfer()`-based calls in a loop: `flush()` costs ~10 ms on L4T. Use one-id `sync_read` and
+SYNC_WRITE (broadcast, so no reply ends up in the RX buffer).
+
+**Goal block layout.** `0x2A` is position(2) | **time**(2) | speed(2), matching Feetech SDK
+`GOAL_POSITION` 42, `GOAL_TIME` 44, `GOAL_SPEED` 46. Always write it with
+`st3215.servo.goal_bytes()` and `GOAL_BLOCK_LEN = 6`. Until 2026-10-02 every write was 4
+bytes, so "speed" landed in goal time and speed was never set.
+
+**Acceleration cap.** The STS3215 ships with an undocumented cap in `0x55` (factory 50) that
+gates `0x29`. At ~10–28 rad/s² it is far below what a 50 Hz policy needs. Both registers are
+RAM, so `Robot.initialize()` clears them at every startup, 0x55 first.
+
 ### Request → hardware flow
 
 ```
@@ -118,6 +134,10 @@ Telemetry (20 Hz, separate thread)
 | `web/app.py` | FastAPI factory, lifespan (starts telemetry, mounts routes) |
 | `tools/bus_profiler.py` | Bus timing profiler — real `ServoBusManager` harness, per-phase stats + histogram |
 | `tools/return_delay.py` | Read/zero the `RETURN_DELAY` EEPROM register on all servos |
+| `tools/servo_registers.py` | Audit/clear the acceleration cap (0x55/0x29), audit torque ceilings, step-response test |
+| `hardware/sysid.py` | High-rate single-servo recorder + the four BAM trajectories (runs on the bus thread) |
+| `robot/sysid.py` | SysID sessions: hanging zero, BAM-format recordings, 12-joint hysteresis screen |
+| `web/routers/sysid.py` + `web/static/js/sysid.js` | SysID tab |
 
 ### Half-duplex UART protocol notes
 
@@ -204,6 +224,31 @@ projected_gravity) is correct.
 
 If the IMU is ever re-mounted, re-derive this with `policy.selftest`'s live `projected_gravity`
 output at those same three poses before trusting anything past it.
+
+### Bundle format v2: action map and servo model
+
+`deploy_config.json` format v2 adds `action_map` and `actuator`. **The map must match training
+exactly**, or every action executes wrongly:
+
+- `absolute` (v1, e.g. `walk_v1`): `target = min + (a+1)/2·(max−min)`, so `a = 0` is the limit
+  midpoint.
+- `centered` (v2): `a = 0` is the default pose, `a = ±1` reach each limit.
+
+`deploy_config.py` refuses an unknown map or a newer format. A v2 bundle's
+`actuator.requires_pid` (P-only: the BAM servo model has no D) is checked against
+`config/robot.yaml` in `PolicyRunner.arm()`, which is why every servo's PID is
+`{p: 32, d: 0, i: 0}`. `arm()` also refuses while a SysID job owns the bus, and both e-stop
+paths abort SysID.
+
+### SysID (servo identification for the training sim)
+
+The SysID tab records the servo for Rhoban BAM; fitting and validation happen in
+`BipedRobot/actuator/` (see its README). Session = one mounting of one servo. Bench
+trajectories swing ±90° about a captured hanging zero, so they are refused for robot-joint
+servo ids unless forced. Recordings are BAM raw JSON in `data/sysid/<session>/`, with
+sidecars in `meta/` (kept out of the dir `bam.process` globs). `data/sysid/loads.json` is a
+copy of `BipedRobot/actuator/rig/loads.json`. *Screen all joints* sweeps each joint ±10°
+in situ and reports hysteresis, which sets the training backlash range.
 
 ### Calibration prerequisite
 

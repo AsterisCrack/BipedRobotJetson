@@ -40,6 +40,13 @@ class Reg:
     # --- RAM (lost on power cycle) ---
     TORQUE_ENABLE    = 0x28   # 0=off, 1=on, 128=zero-calibrate
     ACCELERATION     = 0x29   # unit: 100 step/s²
+    # Undocumented RAM cap that GATES acceleration (0x29) above. Factory value is 50,
+    # which limits the servo to roughly 10-28 rad/s^2 -- far below the ~1000 rad/s^2 a
+    # 50 Hz position policy needs to track a 0.1 rad step inside one control period.
+    # Writing this register alone does nothing: 0x29 must be written afterwards for it
+    # to take effect. Both are RAM, so both reset on every power cycle.
+    # Audit and clear with tools/servo_registers.py.
+    MAX_ACCELERATION = 0x55   # = 85, undocumented
     TARGET_POS_L     = 0x2A   # 2 bytes, little-endian, 0-4095
     RUN_TIME_L       = 0x2C   # 2 bytes
     TARGET_SPEED_L   = 0x2E   # 2 bytes, step/s

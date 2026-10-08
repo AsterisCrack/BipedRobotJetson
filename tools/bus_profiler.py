@@ -185,8 +185,9 @@ def run_profiler(
     uart_floor_ms = (len(sync_read_pkt) + sync_read_rx) * 10 / 1000.0   # 10 bits/byte @ 1 Mbps
     sync_write_len = 0
     if do_write:
-        dummy = [(sid, bytes(4)) for sid in servo_ids]
-        sync_write_len = len(encode_sync_write(Reg.TARGET_POS_L, 4, dummy))
+        # 6 bytes per servo: position | goal time | goal speed (see st3215.servo.goal_bytes)
+        dummy = [(sid, bytes(6)) for sid in servo_ids]
+        sync_write_len = len(encode_sync_write(Reg.TARGET_POS_L, 6, dummy))
         uart_floor_ms += sync_write_len * 10 / 1000.0
 
     bus = SerialBus(
