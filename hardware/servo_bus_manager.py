@@ -30,7 +30,7 @@ from hardware.st3215.protocol import (
     encode_sync_write,
     pack_u16,
     steps_to_bytes,
-    unpack_u16,
+    unpack_sign_magnitude16,
 )
 from hardware.st3215.registers import Reg
 from hardware.st3215.servo import ST3215, ServoStatus
@@ -108,7 +108,7 @@ class ServoBusManager:
         bus: SerialBus,
         imu: BNO055,
         rt_scheduling: bool = False,
-        fast_mode: bool = False,
+        fast_mode: int = 0,
         profiling: bool = False,
     ) -> None:
         self._servos = servos
@@ -118,11 +118,22 @@ class ServoBusManager:
         self._bus = bus
         self._imu = imu
         self._rt_scheduling = rt_scheduling
-        self._fast_mode = fast_mode
+        self._fast_mode = int(fast_mode)
         self._profiling = profiling
 
-        # fast_mode reads only position (2 bytes); normal reads full 8-byte status.
-        self._sync_read_data_len: int = 2 if fast_mode else Reg.STATUS_LEN
+        # How much of the status block to pull per servo. Shorter is faster on the wire
+        # but zero-fills the fields it skips; mode 2 exists because the RL policy needs
+        # speed and nothing else from this block.
+        try:
+            self._sync_read_data_len: int = {
+                0: Reg.STATUS_LEN,            # pos, speed, load, voltage, temp
+                1: Reg.STATUS_LEN_POS,        # pos
+                2: Reg.STATUS_LEN_POS_SPEED,  # pos, speed
+            }[self._fast_mode]
+        except KeyError:
+            raise ValueError(
+                f"fast_mode must be 0 (full), 1 (position only) or 2 (position+speed), "
+                f"got {fast_mode!r}") from None
 
         # Precompute the SYNC_READ packet (constant for this robot).
         self._sync_read_packet = encode_sync_read(
@@ -236,11 +247,15 @@ class ServoBusManager:
         Acquires state lock once; projected_gravity math runs outside lock.
 
         Keys:
-            positions         list[float]              servo deg in config order
-            velocities        list[int]                servo speed counts (0 in fast_mode)
+            positions         list[float]              URDF deg in config order
+            velocities        list[int]                signed speed counts (0 if fast_mode==1)
+            velocities_deg_s  list[float]              URDF deg/s, direction_sign applied
             linear_accel      tuple[float, float, float]  body-frame m/s² (x,y,z)
             angular_vel       tuple[float, float, float]  body-frame rad/s (x,y,z)
             projected_gravity tuple[float, float, float]  world [0,0,-1] in body frame
+
+        `velocities` stays in raw counts for telemetry; the policy wants
+        `velocities_deg_s`, which matches `positions` in both frame and sign.
         """
         with self._state_lock:
             states_by_name = {s.joint_name: s for s in self._servo_states_by_id.values()}
@@ -248,10 +263,14 @@ class ServoBusManager:
 
         positions:  list[float] = []
         velocities: list[int]   = []
+        velocities_deg_s: list[float] = []
         for servo in self._servos:          # preserves config ordering
             status = states_by_name.get(servo.joint_name)
             positions.append(status.position_deg if status else 0.0)
             velocities.append(status.speed       if status else 0)
+            velocities_deg_s.append(
+                servo.steps_per_s_to_deg_per_s(status.speed) if status else 0.0
+            )
 
         # Rotate world gravity [0,0,-1] into body frame: g_body = R_wb^T @ [0,0,-1]
         # Identity quaternion (w=1,x=y=z=0) → (0, 0, -1): upright robot, gravity straight down ✓
@@ -270,10 +289,16 @@ class ServoBusManager:
         return {
             "positions":         positions,
             "velocities":        velocities,
+            "velocities_deg_s":  velocities_deg_s,
             "linear_accel":      imu.accel,
             "angular_vel":       imu.gyro,
             "projected_gravity": (gx, gy, gz),
         }
+
+    @property
+    def has_velocity(self) -> bool:
+        """True if SYNC_READ pulls the speed register — fast_mode 0 or 2, not 1."""
+        return self._sync_read_data_len >= Reg.STATUS_LEN_POS_SPEED
 
     @property
     def cycle_hz(self) -> float:
@@ -459,37 +484,21 @@ class ServoBusManager:
                         "SYNC_READ: short response from servo %d (%d bytes)", sid, len(data)
                     )
                 continue
+            # Fields past the requested width were never read; they stay zero.
+            n = self._sync_read_data_len
             pos_steps = bytes_to_steps(data, 0)
-            if self._fast_mode:
-                results[sid] = ServoStatus(
-                    servo_id=sid,
-                    joint_name=servo.joint_name,
-                    position_deg=round(servo.steps_to_deg(pos_steps), 2),
-                    raw_steps=pos_steps,
-                    raw_deg=round(pos_steps / (4096.0 / 360.0), 2),
-                    speed=0,
-                    load=0,
-                    voltage_v=0.0,
-                    temperature_c=0,
-                    torque_enabled=servo.torque_enabled,
-                )
-            else:
-                speed_val = unpack_u16(data, 2)
-                load      = unpack_u16(data, 4)
-                voltage   = data[6]
-                temp      = data[7]
-                results[sid] = ServoStatus(
-                    servo_id=sid,
-                    joint_name=servo.joint_name,
-                    position_deg=round(servo.steps_to_deg(pos_steps), 2),
-                    raw_steps=pos_steps,
-                    raw_deg=round(pos_steps / (4096.0 / 360.0), 2),
-                    speed=speed_val,
-                    load=load,
-                    voltage_v=round(voltage * 0.1, 2),
-                    temperature_c=temp,
-                    torque_enabled=servo.torque_enabled,
-                )
+            results[sid] = ServoStatus(
+                servo_id=sid,
+                joint_name=servo.joint_name,
+                position_deg=round(servo.steps_to_deg(pos_steps), 2),
+                raw_steps=pos_steps,
+                raw_deg=round(pos_steps / (4096.0 / 360.0), 2),
+                speed=unpack_sign_magnitude16(data, 2) if n >= Reg.STATUS_LEN_POS_SPEED else 0,
+                load=unpack_sign_magnitude16(data, 4) if n >= Reg.STATUS_LEN else 0,
+                voltage_v=round(data[6] * 0.1, 2) if n >= Reg.STATUS_LEN else 0.0,
+                temperature_c=data[7] if n >= Reg.STATUS_LEN else 0,
+                torque_enabled=servo.torque_enabled,
+            )
 
         if self._profiling:
             missed = len(self._servo_ids) - len(results)

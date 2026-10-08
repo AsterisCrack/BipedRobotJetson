@@ -204,7 +204,7 @@ manager.stop()
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `rt_scheduling` | `False` | Apply `SCHED_FIFO` priority 10 to bus thread (needs root or `CAP_SYS_NICE`) |
-| `fast_mode` | `False` | Read only position (2 B/servo) instead of full 8-byte status |
+| `fast_mode` | `0` | SYNC_READ width per servo: `0` full 8 B status, `1` position only (2 B), `2` position+speed (4 B). Skipped fields read as 0; see `has_velocity` |
 | `profiling` | `False` | Collect per-phase timing for `get_profile_stats()` |
 
 **Profiling API** (requires `profiling=True`):
@@ -227,7 +227,8 @@ stats = manager.get_profile_stats()
 obs = manager.get_rl_state()
 # {
 #   "positions":         list[float]               # servo deg, config order (URDF space)
-#   "velocities":        list[int]                 # servo speed counts (0 in fast_mode)
+#   "velocities":        list[int]                 # signed speed counts (0 if fast_mode==1)
+#   "velocities_deg_s":  list[float]               # URDF deg/s, direction_sign applied
 #   "linear_accel":      (ax, ay, az)              # body-frame m/s²
 #   "angular_vel":       (gx, gy, gz)              # body-frame rad/s
 #   "projected_gravity": (gx, gy, gz)              # world [0,0,-1] in body frame

@@ -43,6 +43,7 @@ def _synthetic_state(joint_names):
     return {
         "positions": [0.0] * len(joint_names),
         "velocities": [0] * len(joint_names),
+        "velocities_deg_s": [0.0] * len(joint_names),
         "linear_accel": (0.0, 0.0, 0.0),   # BNO055 LIA: gravity already removed
         "angular_vel": (0.0, 0.0, 0.0),
         "projected_gravity": (0.0, 0.0, -1.0),
@@ -83,6 +84,10 @@ def main() -> int:
         robot = Robot(Settings.load())
         robot.initialize()
         bm = robot._bus_manager
+        if not bm.has_velocity:
+            print("BIPED_FAST_MODE=1 omits the speed register, so the policy's joint_vel "
+                  "channel would read zero. Use BIPED_FAST_MODE=2 (pos+speed) or 0.")
+            return 1
         robot_names = [s.joint_name for s in bm._servos]
         defaults = {s.joint_name: float(getattr(s, "default_position_deg", 0.0))
                     for s in bm._servos}
@@ -128,6 +133,12 @@ def main() -> int:
     # -- joint mapping -------------------------------------------------------
     print("\n=== joint mapping (robot order -> policy order) ===")
     pos_rad = mapper.robot_deg_to_policy_rad(rl["positions"])
+    vel_rad = mapper.robot_rate_to_policy_rad(rl["velocities_deg_s"])
+    # Backdrive a joint by hand while this runs: the matching slot should move, with a
+    # sign that matches the direction. That is the only check for the sign-magnitude
+    # decode and direction_sign, both of which fail silently.
+    print(f"joint_vel |max| = {float(np.abs(vel_rad).max()):.3f} rad/s "
+          f"(expect ~0 at rest; backdrive a joint to see it move)")
     print(f"{'policy slot':<24}{'URDF deg':>10}{'logical deg':>13}{'limit deg':>16}")
     for i, name in enumerate(cfg.joint_names):
         urdf = rl["positions"][robot_names.index(name)]
@@ -143,7 +154,7 @@ def main() -> int:
     import onnxruntime as ort
     sess = ort.InferenceSession(cfg.onnx_path, providers=["CPUExecutionProvider"])
 
-    frame = ob.build_frame(sf, gyro, pg, [0, 0, 0], pos_rad, np.zeros(cfg.action_dim),
+    frame = ob.build_frame(sf, gyro, pg, [0, 0, 0], pos_rad, vel_rad,
                            advance_phase=False)
     ob.reset(standing_frame=frame)
 

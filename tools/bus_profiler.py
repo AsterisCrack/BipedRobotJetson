@@ -201,7 +201,7 @@ def run_profiler(
     manager = ServoBusManager(
         servo_objects, bus, imu,
         rt_scheduling=True,    # request SCHED_FIFO (needs root or setcap)
-        fast_mode=False,       # full 8-byte status read (same as production default)
+        fast_mode=0,           # full 8-byte status read (same as production default)
         profiling=True,
     )
 
@@ -359,7 +359,7 @@ def run_profiler(
     if spare_p5 > 0:
         print(f"  → At worst (P5), {spare_p5:.1f} ms available for NN inference per cycle")
     else:
-        print(f"  ✗ No spare time at P5 — reduce load or enable BIPED_FAST_MODE=1")
+        print(f"  ✗ No spare time at P5 — reduce load or set BIPED_FAST_MODE=2 (−480 µs, keeps speed)")
 
     print()
     if overhead_ms > 1.0:
