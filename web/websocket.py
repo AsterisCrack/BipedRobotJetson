@@ -115,6 +115,7 @@ class TelemetryBroadcaster:
             elif msg_type == "policy_estop":
                 # Also exposed over the socket so the UI can cut torque without
                 # waiting on an HTTP round-trip.
+                robot.abort_sysid()
                 runner = robot.policy
                 if runner is not None:
                     runner.estop()

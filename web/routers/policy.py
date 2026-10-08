@@ -122,6 +122,7 @@ def estop(request: Request):
     """Immediate torque cut. Deliberately never raises -- an e-stop that can fail
     with a 409 is not an e-stop."""
     robot = _robot(request)
+    robot.abort_sysid()        # a running recording would keep commanding its servo
     runner = robot.policy
     if runner is None:
         try:

@@ -14,6 +14,7 @@ from hardware.imu.bno055 import BNO055, IMUReading
 from hardware.serial_bus import SerialBus, SerialBusError
 from hardware.servo_bus_manager import ServoBusManager
 from hardware.st3215.protocol import encode_ping
+from hardware.st3215.registers import Reg
 from hardware.st3215.servo import ST3215, ServoStatus
 from kinematics.chain import KinematicChain
 from kinematics.solver import IKResult, KinematicSolver
@@ -127,6 +128,22 @@ class Robot:
                     servo.apply_config_pid()
                 except SerialBusError as exc:
                     logger.warning("PID apply failed for %s: %s", servo.joint_name, exc)
+
+            # Clear the acceleration cap. The STS3215 ships with an undocumented limit
+            # in 0x55 (factory value 50) that gates 0x29, holding the servo to roughly
+            # 10-28 rad/s^2. A 50 Hz position policy needs ~1000 rad/s^2 to track a
+            # 0.1 rad step inside one control period, so under the factory cap the servo
+            # simply cannot follow it. Both registers are RAM and revert on every power
+            # cycle, which is why this runs at every startup rather than once.
+            # Order matters: 0x55 first, then 0x29, or the write does not take.
+            # Audit with tools/servo_registers.py.
+            for servo in self._servos.values():
+                try:
+                    servo.write_register(Reg.MAX_ACCELERATION, bytes([0]))
+                    servo.write_register(Reg.ACCELERATION, bytes([0]))
+                except SerialBusError as exc:
+                    logger.warning("Acceleration-cap clear failed for %s: %s",
+                                   servo.joint_name, exc)
 
             # Safety: ensure torques are disabled on startup
             self.disable_all_torques()
@@ -296,6 +313,29 @@ class Robot:
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
             self._policy = PolicyRunner(self, models_root)
         return self._policy
+
+    @property
+    def sysid(self):
+        """Lazily-created SysidManager: bench recordings for BAM and the 12-joint screen."""
+        if getattr(self, "_sysid", None) is None:
+            from robot.sysid import SysidManager
+            self._sysid = SysidManager(self)
+        return self._sysid
+
+    def abort_sysid(self) -> None:
+        """E-stop path: trip the running sysid job's abort flag. Never raises."""
+        mgr = getattr(self, "_sysid", None)
+        if mgr is not None:
+            try:
+                mgr.abort()
+            except Exception:
+                logger.exception("sysid abort failed during e-stop")
+
+    @property
+    def sysid_active(self) -> bool:
+        """True while a sysid job owns the bus. The policy must not arm then."""
+        mgr = getattr(self, "_sysid", None)
+        return mgr is not None and mgr.state != "idle"
 
     def attach_policy_hook(self) -> bool:
         """Route the bus thread's per-cycle callback into the policy runner."""

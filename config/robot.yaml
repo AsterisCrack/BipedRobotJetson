@@ -8,90 +8,95 @@ home_pose: stand
 # direction_sign: +1 or -1 — maps physical servo rotation to URDF joint convention
 # zero_offset_steps: raw encoder count (0-4095) when joint is at 0 degrees
 
+# PID is P-only (d: 0, i: 0) ON PURPOSE. The policy's servo model is BAM's identified
+# STS3215 model (BipedRobot/actuator/), whose firmware law is P-only. With D left at the
+# factory 16, the robot would run a different actuator than the one the policy trained
+# against. PolicyRunner.arm() refuses a v2 bundle whose requires_pid doesn't match these.
+# Changed from d: 16 on 2026-10-02 -- re-baseline anything tuned against the old feel.
 servos:
   - servo_id: 13
     joint_name: l_hip_yaw
     direction_sign: 1
     zero_offset_steps: 2048
     default_position_deg: -33.66
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 2
     joint_name: l_hip_roll_joint
     direction_sign: -1
     zero_offset_steps: 2048
     default_position_deg: -77.26
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 3
     joint_name: l_hip_pitch_joint
     direction_sign: -1
     zero_offset_steps: 2048
     default_position_deg: 37.44
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 4
     joint_name: l_knee_joint
     direction_sign: -1
     zero_offset_steps: 2048
     default_position_deg: 134.38
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 5
     joint_name: l_ankle_roll_joint
     direction_sign: -1
     zero_offset_steps: 2048
     default_position_deg: -8.7
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 6
     joint_name: l_ankle_pitch_joint
     direction_sign: -1
     zero_offset_steps: 2048
     default_position_deg: -21.88
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 7
     joint_name: r_hip_yaw
     direction_sign: -1
     zero_offset_steps: 2048
     default_position_deg: -4.75
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 8
     joint_name: r_hip_roll_joint
     direction_sign: 1
     zero_offset_steps: 2048
     default_position_deg: -7.56
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 9
     joint_name: r_hip_pitch_joint
     direction_sign: 1
     zero_offset_steps: 2048
     default_position_deg: 29.62
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 10
     joint_name: r_knee_joint
     direction_sign: 1
     zero_offset_steps: 2048
     default_position_deg: 3.6
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 11
     joint_name: r_ankle_roll_joint
     direction_sign: 1
     zero_offset_steps: 2048
     default_position_deg: 5.71
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
   - servo_id: 12
     joint_name: r_ankle_pitch_joint
     direction_sign: 1
     zero_offset_steps: 2048
     default_position_deg: 89.47
-    pid: {p: 32, d: 16, i: 0}
+    pid: {p: 32, d: 0, i: 0}
 
 poses:
   stand:

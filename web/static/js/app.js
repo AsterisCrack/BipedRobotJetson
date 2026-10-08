@@ -9,6 +9,7 @@ import { initRobot3D, onRobotTelemetry, onFKResult } from './robot3d.js';
 import { initIdManager } from './id_manager.js';
 import { initDebug, onDebugTelemetry } from './debug.js';
 import { initControl, onControlTelemetry } from './control.js';
+import { initSysid } from './sysid.js';
 
 // ── Tab routing ──────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -108,4 +109,5 @@ initRobot3D();
 initIdManager();
 initDebug();
 initControl();
+initSysid();
 connect();
