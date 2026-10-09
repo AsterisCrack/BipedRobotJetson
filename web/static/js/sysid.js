@@ -15,6 +15,7 @@ let lastStatus = null;
 let liveNext = 0;
 let liveSamples = [];
 let livePoll = null;
+let autoRunning = false;
 
 async function api(path, body) {
   const res = await fetch(`/api/sysid/${path}`, body === undefined ? {} : {
@@ -61,7 +62,9 @@ function renderControls(st) {
   const holes = (st.rig && st.rig.loads) || [];
   fillSelect($('sid-hole'), holes.map((l, i) => [i, l]), l => `${(l.hole_m * 1000).toFixed(0)} mm hole`);
 
-  const busy = st.state !== 'idle';
+  // autoRunning is included even though its own pauses leave st.state === 'idle': otherwise
+  // a manual click during the "move the weight" pause would race the sequence's next /run.
+  const busy = st.state !== 'idle' || autoRunning;
   $('sid-state').textContent = st.state;
   $('sid-zero-meta').textContent = st.zero_steps == null
     ? 'Torque goes off; let the arm hang still.'
@@ -70,6 +73,7 @@ function renderControls(st) {
   $('sid-zero').disabled = busy || !st.session;
   $('sid-run').disabled = busy || st.zero_steps == null || !(st.rig && st.rig.available);
   $('sid-screen').disabled = busy;
+  $('sid-auto-start').disabled = busy || st.zero_steps == null || !(st.rig && st.rig.available);
   if (st.last_error) $('sid-error').textContent = st.last_error;
 
   const last = st.last;
@@ -80,6 +84,39 @@ function renderControls(st) {
   }
 }
 
+// Parses recording filenames into "trajectory|kp|hole" keys. Shared by the coverage
+// grid and by buildCombos(), which needs the same "already recorded" set to skip cells.
+function doneSet(st) {
+  const files = st.files || [];
+  return new Set(files.map(f => {
+    const m = f.match(/_([a-z_]+)_kp(\d+)_h(\d+)\.json$/);
+    return m ? `${m[1]}|${m[2]}|${m[3]}` : null;
+  }).filter(Boolean));
+}
+
+function holeLabel(st, idx) {
+  const loads = (st.rig && st.rig.loads) || [];
+  return loads[idx] ? `${(loads[idx].hole_m * 1000).toFixed(0)} mm` : `hole ${idx}`;
+}
+
+// Every (hole, kp, trajectory) cell not yet recorded, ordered hole-major so "Record all
+// remaining" finishes one weight position before asking to move to the next.
+function buildCombos(st) {
+  const kps = (st.rig && st.rig.kp_sweep) || [4, 8, 16, 32];
+  const holes = ((st.rig && st.rig.loads) || []).map((_, i) => i);
+  const trajectories = st.trajectories || [];
+  const done = doneSet(st);
+  const combos = [];
+  for (const h of holes) {
+    for (const k of kps) {
+      for (const t of trajectories) {
+        if (!done.has(`${t}|${k}|${h}`)) combos.push({ hole: h, kp: k, trajectory: t });
+      }
+    }
+  }
+  return combos;
+}
+
 function renderFiles(st) {
   const files = st.files || [];
   $('sid-files').innerHTML = files.map(f => `<li>${f}</li>`).join('');
@@ -88,10 +125,7 @@ function renderFiles(st) {
   // Coverage: trajectory rows x (hole, kp) columns.
   const kps = (st.rig && st.rig.kp_sweep) || [4, 8, 16, 32];
   const holes = ((st.rig && st.rig.loads) || []).map((_, i) => i);
-  const done = new Set(files.map(f => {
-    const m = f.match(/_([a-z_]+)_kp(\d+)_h(\d+)\.json$/);
-    return m ? `${m[1]}|${m[2]}|${m[3]}` : null;
-  }).filter(Boolean));
+  const done = doneSet(st);
   const cols = holes.flatMap(h => kps.map(k => [h, k]));
   const grid = $('sid-grid');
   grid.style.gridTemplateColumns = `8rem repeat(${cols.length}, 1fr)`;
@@ -120,18 +154,102 @@ function renderScreen(st) {
     `<td>${r.lag_down_deg ?? '—'}</td><td>${r.achieved_hz ?? '—'}</td></tr>`).join('');
 }
 
+function renderAll(st) {
+  renderRig(st.rig);
+  renderControls(st);
+  renderFiles(st);
+  renderScreen(st);
+}
+
 async function refresh() {
   try {
     const st = await (await fetch('/api/sysid/status')).json();
     const wasRunning = lastStatus && lastStatus.state !== 'idle';
     lastStatus = st;
-    renderRig(st.rig);
-    renderControls(st);
-    renderFiles(st);
-    renderScreen(st);
+    renderAll(st);
     if (st.state !== 'idle' && !livePoll) startLive();
     if (st.state === 'idle' && wasRunning) stopLive();
   } catch { /* server restarting; the next tick retries */ }
+}
+
+// ── auto-record: run every un-recorded (hole, kp, trajectory) cell in sequence ─────────────
+
+async function fetchStatus() {
+  const st = await (await fetch('/api/sysid/status')).json();
+  lastStatus = st;
+  renderAll(st);
+  return st;
+}
+
+async function waitIdle() {
+  let st = await fetchStatus();
+  while (st.state !== 'idle') {
+    await new Promise(r => setTimeout(r, 300));
+    st = await fetchStatus();
+  }
+  return st;
+}
+
+function setAutoUI(running, meta) {
+  autoRunning = running;
+  $('sid-auto-start').style.display = running ? 'none' : '';
+  $('sid-auto-stop').style.display = running ? '' : 'none';
+  if (meta !== undefined) $('sid-auto-meta').textContent = meta;
+}
+
+// Blocks until the user confirms the weight has been moved. Used once per hole, including
+// the first, so there is never ambiguity about which hole is currently mounted.
+function pauseForHole(label) {
+  return new Promise(resolve => {
+    $('sid-auto-modal-text').textContent = `Move the weight to the ${label} hole, then click Continue.`;
+    $('sid-auto-modal').classList.remove('hidden');
+    const onClick = () => {
+      $('sid-auto-modal').classList.add('hidden');
+      $('sid-auto-continue').removeEventListener('click', onClick);
+      resolve();
+    };
+    $('sid-auto-continue').addEventListener('click', onClick);
+  });
+}
+
+function stopAuto() {
+  autoRunning = false;
+  $('sid-auto-modal').classList.add('hidden');
+  fetch('/api/sysid/abort', { method: 'POST' }).catch(() => {});
+}
+
+async function runAutoSequence() {
+  let st = await waitIdle();
+  const combos = buildCombos(st);
+  if (!combos.length) {
+    $('sid-auto-meta').textContent = 'Nothing to record — the grid is already complete.';
+    return;
+  }
+  setAutoUI(true);
+  let lastHole = null;
+  let stoppedEarly = false;
+  for (let i = 0; i < combos.length; i++) {
+    if (!autoRunning) { stoppedEarly = true; break; }
+    const c = combos[i];
+    if (c.hole !== lastHole) {
+      lastHole = c.hole;
+      $('sid-auto-meta').textContent = `Waiting — move the weight to ${holeLabel(st, c.hole)}…`;
+      await pauseForHole(holeLabel(st, c.hole));
+      if (!autoRunning) { stoppedEarly = true; break; }
+    }
+    $('sid-auto-meta').textContent =
+      `Recording ${i + 1}/${combos.length}: ${c.trajectory} · kp${c.kp} · ${holeLabel(st, c.hole)}`;
+    try {
+      await api('run', { trajectory: c.trajectory, kp: c.kp, hole: c.hole });
+    } catch {
+      stoppedEarly = true;   // api() already surfaced the error in #sid-error
+      break;
+    }
+    startLive();
+    st = await waitIdle();
+  }
+  setAutoUI(false, stoppedEarly ? 'Auto-record stopped.' : 'Auto-record finished — grid complete.');
+  refresh();
 }
 
 // ── live plot ─────────────────────────────────────────────────────────────────
@@ -206,8 +324,12 @@ export function initSysid() {
   if (!$('tab-sysid')) return;
 
   // ABORT goes over REST and never throws: like the e-stop, an abort must not fail.
-  $('sid-abort').addEventListener('click', () => {
-    fetch('/api/sysid/abort', { method: 'POST' }).catch(() => {});
+  // Also stops any auto-record sequence in progress -- an abort mid-sequence must not
+  // silently continue on to the next cell.
+  $('sid-abort').addEventListener('click', stopAuto);
+  $('sid-auto-stop').addEventListener('click', stopAuto);
+  $('sid-auto-start').addEventListener('click', () => {
+    if (!autoRunning) runAutoSequence();
   });
   $('sid-start-session').addEventListener('click', () => api('session', {
     name: $('sid-session-name').value.trim(), servo_id: parseInt($('sid-servo-id').value, 10),

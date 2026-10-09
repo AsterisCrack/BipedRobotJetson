@@ -429,6 +429,12 @@
           <button id="sid-run" class="ctl-go">Record 6 s</button>
           <span class="ctl-meta" id="sid-run-meta"></span>
         </div>
+        <div class="ctl-row">
+          <button id="sid-auto-start" class="ctl-go">Record all remaining</button>
+          <button id="sid-auto-stop" class="danger" style="display:none">Stop auto</button>
+          <span class="ctl-meta" id="sid-auto-meta">Runs every un-recorded trajectory × kp for
+            every hole in order, pausing only to ask you to move the weight.</span>
+        </div>
       </div>
 
       <div class="ctl-card ctl-wide">
@@ -460,6 +466,17 @@
         <table class="sid-small"><thead><tr>
           <th>Joint</th><th>Hysteresis °</th><th>Lag ↑ °</th><th>Lag ↓ °</th><th>Hz</th>
         </tr></thead><tbody id="sid-screen-tbody"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Auto-record pause: shown between holes while "Record all remaining" is running -->
+  <div class="modal-overlay hidden" id="sid-auto-modal">
+    <div class="modal">
+      <h3>Move the weight</h3>
+      <p class="warn" id="sid-auto-modal-text"></p>
+      <div class="modal-actions">
+        <button id="sid-auto-continue" class="ctl-go">Continue</button>
       </div>
     </div>
   </div>

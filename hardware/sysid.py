@@ -151,10 +151,41 @@ class SysidJob:
         period = 1.0 / self.rate_hz
         aborted = False
         try:
-            # First goal = current position, torque on, so the run starts without a jump.
+            # ---- ramp-in: ease to the trajectory's t=0 position before timing starts ----
+            # The previous recording left torque off wherever its trajectory ended (e.g.
+            # lift_and_drop ends at -90 deg), not at this trajectory's start. Snapping
+            # torque on straight into trajectory(t=0) would hit a large, uncontrolled step
+            # exactly at the sample the BAM trajectories assume is a settled, ~zero-velocity
+            # start. This phase is not recorded and not timed against duration_s.
+            start_goal, _ = self.trajectory(0.0)
+            data0 = bus.sync_read(read_pkt, [sid], STATUS_LEN).get(sid)
+            current = (bytes_to_steps(data0, 0) - self.zero_steps) * RAD_PER_STEP \
+                if data0 is not None else start_goal
+            ramp_s = 1.5
+            bus.send_no_reply(torque_pkt[True])
+            torque_on = True
+            t_ramp0 = time.perf_counter()
+            t_next = t_ramp0
+            while not self.abort.is_set():
+                tr = time.perf_counter() - t_ramp0
+                if tr >= ramp_s:
+                    break
+                frac = tr / ramp_s
+                bus.send_no_reply(goal_pkt(current + (start_goal - current) * frac))
+                bus.sync_read(read_pkt, [sid], STATUS_LEN)   # drain reply; not recorded
+                t_next += period
+                sleep = t_next - time.perf_counter()
+                if sleep > 0:
+                    time.sleep(sleep)
+                else:
+                    t_next = time.perf_counter()
+            if self.abort.is_set():
+                aborted = True
+
+            # ---- timed recording ----
             t0 = time.perf_counter()
             t_next = t0
-            while True:
+            while not aborted:
                 t = time.perf_counter() - t0
                 if t >= self.duration_s:
                     break
