@@ -69,6 +69,11 @@ def main() -> int:
           f"hist={cfg.history_size}x{cfg.obs_proprio_dim} @ {cfg.control_hz:.0f} Hz")
     if cfg.info:
         print(f"source : {cfg.info.get('run','?')} step {cfg.info.get('step','?')}")
+    gc = cfg.gait_clock
+    print("clock  : " + (f"fixed period {gc['period']:.3f} s, holds below {gc['stand_threshold']:.2f} m/s "
+                         f"(table {gc.get('style_digest', '?')})" if gc["mode"] == "fixed_period"
+                         else f"speed-proportional {gc['freq']:.2f} Hz per m/s"))
+    print(f"ranges : {cfg.command_ranges}")
     print()
 
     # -- sensors -------------------------------------------------------------

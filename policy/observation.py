@@ -141,6 +141,10 @@ class ObservationBuilder:
         self.obs_dim = cfg.obs_dim
         self.action_dim = cfg.action_dim
         self.gait_clock_freq = cfg.gait_clock_freq
+        gc = getattr(cfg, "gait_clock", None) or {"mode": "speed_proportional", "freq": cfg.gait_clock_freq}
+        self.gait_mode = gc["mode"]
+        self.gait_period = float(gc.get("period", 0.0))
+        self.gait_stand_threshold = float(gc.get("stand_threshold", 0.05))
         self.step_dt = cfg.step_dt
         self.layout = cfg.obs_layout
 
@@ -191,6 +195,33 @@ class ObservationBuilder:
             self._history[:] = frame
             self._primed = True
 
+    # -- gait clock ----------------------------------------------------------
+
+    def _advance_phase(self, cmd: np.ndarray) -> None:
+        """Advance the gait clock one control step, exactly as training does.
+
+        Once per control step, before the frame is built (Isaac advances it after physics, so the
+        observation shows the post-step phase).
+
+        fixed_period (gait-table policies, bundle v3): constant rate 2*pi/period while the command
+            is at or above stand_threshold (|v_xy| or |wz|), held otherwise. Mirrors
+            BipedEnv._advance_gait_phase. Phase 0 = right-foot touchdown, [0, 0.5) right stance.
+        speed_proportional (v1/v2): rate proportional to commanded xy speed; zero command holds it.
+        """
+        if self.gait_mode == "fixed_period":
+            thr = self.gait_stand_threshold
+            moving = math.hypot(float(cmd[0]), float(cmd[1])) >= thr or abs(float(cmd[2])) >= thr
+            if moving:
+                self._gait_phase = (
+                    self._gait_phase + self.step_dt * 2.0 * math.pi / self.gait_period
+                ) % (2.0 * math.pi)
+        else:
+            v_cmd = float(np.linalg.norm(cmd[:2]))
+            self._gait_phase = (
+                self._gait_phase
+                + self.step_dt * 2.0 * math.pi * self.gait_clock_freq * v_cmd
+            ) % (2.0 * math.pi)
+
     # -- assembly ------------------------------------------------------------
 
     def build_frame(
@@ -207,14 +238,7 @@ class ObservationBuilder:
         cmd = np.asarray(commands, dtype=np.float64)
 
         if advance_phase:
-            # Isaac advances the clock proportional to COMMANDED xy speed, once per
-            # control step, inside _get_observations (i.e. after physics). Standing
-            # still (zero command) freezes the phase, which is intentional.
-            v_cmd = float(np.linalg.norm(cmd[:2]))
-            self._gait_phase = (
-                self._gait_phase
-                + self.step_dt * 2.0 * math.pi * self.gait_clock_freq * v_cmd
-            ) % (2.0 * math.pi)
+            self._advance_phase(cmd)
 
         frame = np.concatenate([
             np.asarray(specific_force_b, dtype=np.float64),      # 3

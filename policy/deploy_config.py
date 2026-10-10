@@ -60,6 +60,10 @@ class DeployConfig:
     # "requires_pid": {"p": 32, "d": 0, "i": 0}, ...}. None for v1 bundles.
     actuator: dict | None = None
     format_version: int = 1
+    # Gait clock the policy was trained with. {"mode": "speed_proportional", "freq": Hz} advances
+    # with commanded speed (v1/v2); {"mode": "fixed_period", "period": s, "stand_threshold": m/s,
+    # ...} is the gait-table clock (v3): fixed rate, held while the command is below the threshold.
+    gait_clock: dict = field(default_factory=dict)
     info: dict = field(default_factory=dict)
 
     @property
@@ -143,14 +147,36 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     # Format v2 added the action map and servo model. Refuse anything newer than we
     # understand: a runtime that guesses the map would mis-execute every action.
     fmt = int(raw.get("format_version", 1))
-    if fmt > 2:
-        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (2)")
+    if fmt > 3:
+        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (3)")
     action_map = raw.get("action_map", "absolute" if fmt == 1 else None)
     if action_map not in ("absolute", "centered"):
         raise ValueError(f"unknown or missing action_map {action_map!r} (format v{fmt})")
     default_pos = np.asarray(raw.get("default_joint_pos", [0.0] * action_dim), dtype=np.float64)
     if action_map == "centered" and (np.any(default_pos >= hi) or np.any(default_pos <= lo)):
         raise ValueError("centered action map needs every default_joint_pos strictly inside its limits")
+
+    # Format v3 added a fixed-period gait clock (gait-table policies). A runtime that fell back to
+    # the speed-proportional clock would feed the policy a phase it never saw, so v3 REQUIRES the
+    # block and every mode is validated rather than defaulted.
+    gait_clock = raw.get("gait_clock")
+    if gait_clock is None:
+        if fmt >= 3:
+            raise ValueError("format v3 bundle has no gait_clock block")
+        gait_clock = {"mode": "speed_proportional", "freq": float(raw["gait_clock_freq"])}
+    mode = gait_clock.get("mode")
+    if mode == "fixed_period":
+        period = float(gait_clock.get("period", 0.0))
+        if not (0.2 < period < 5.0):
+            raise ValueError(f"gait_clock.period {period!r} s is implausible (expected 0.2-5 s)")
+        thr = float(gait_clock.get("stand_threshold", 0.05))
+        if thr < 0.0:
+            raise ValueError("gait_clock.stand_threshold must be >= 0")
+        gait_clock = {**gait_clock, "period": period, "stand_threshold": thr}
+    elif mode == "speed_proportional":
+        gait_clock = {**gait_clock, "freq": float(gait_clock.get("freq", raw["gait_clock_freq"]))}
+    else:
+        raise ValueError(f"unknown gait_clock.mode {mode!r}")
 
     eps = float(raw["obs_epsilon"])
     applications = int(raw["action_filter_applications_per_step"])
@@ -189,6 +215,7 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
         action_map=action_map,
         actuator=raw.get("actuator"),
         format_version=fmt,
+        gait_clock=gait_clock,
         info=info,
     )
 
@@ -211,6 +238,7 @@ def discover_bundles(models_root: str) -> list[dict]:
                 obs_dim=cfg.obs_dim, action_dim=cfg.action_dim,
                 control_hz=cfg.control_hz, info=cfg.info,
                 action_map=cfg.action_map, actuator=cfg.actuator,
+                gait_clock=cfg.gait_clock,
             )
         except Exception as exc:  # surface broken bundles rather than hiding them
             entry.update(valid=False, error=str(exc))

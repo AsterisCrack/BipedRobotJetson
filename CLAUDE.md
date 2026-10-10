@@ -234,11 +234,35 @@ exactly**, or every action executes wrongly:
   midpoint.
 - `centered` (v2): `a = 0` is the default pose, `a = ±1` reach each limit.
 
-`deploy_config.py` refuses an unknown map or a newer format. A v2 bundle's
+`deploy_config.py` refuses an unknown map or a newer format (v3 is the newest; see below). A v2 bundle's
 `actuator.requires_pid` (P-only: the BAM servo model has no D) is checked against
 `config/robot.yaml` in `PolicyRunner.arm()`, which is why every servo's PID is
 `{p: 32, d: 0, i: 0}`. `arm()` also refuses while a SysID job owns the bus, and both e-stop
 paths abort SysID.
+
+### Bundle format v3: fixed-period gait clock (gait-table policies)
+
+Policies trained with Gait Studio imitation (`BipedRobot/config/config_gait_reference.yaml`) read
+the gait clock as an observation, `[sin, cos]` of the phase in `obs[48:50]`, and it runs
+differently from the older policies. `deploy_config.json` carries it in `gait_clock`:
+
+| mode | advance per control step | bundle |
+|---|---|---|
+| `speed_proportional` | `step_dt · 2π · freq · |v_xy|` (a zero command holds it) | v1, v2 |
+| `fixed_period` | `step_dt · 2π / period`, **only while** `|v_xy| ≥ stand_threshold` or `|wz| ≥ stand_threshold`, otherwise held | v3 |
+
+`ObservationBuilder._advance_phase` does this once per control step, before the frame is built,
+which is the order training uses. The rate does not depend on speed. `load_bundle` refuses a v3
+bundle with no `gait_clock`, an unknown mode, or an implausible period (0.2–5 s), and refuses
+anything newer than v3: a runtime that fell back to the old clock would hand the policy a phase it
+never saw. Phase 0 = right-foot touchdown, `[0, 0.5)` right stance. The runtime starts at phase 0
+on `start()`; training started at a random phase, so any start phase is in-distribution.
+
+The command is the one `PolicyRunner` hands the policy, i.e. already clamped to
+`command_ranges` and multiplied by `velocity_scale`, so a small velocity scale can drop it below
+`stand_threshold` and hold the clock. That matches what the policy sees as its command input.
+`command_ranges` now comes from the run's own config (gait-table runs: vx ±0.2, vy ±0.15, wz ±1.2).
+`selftest` prints the clock mode and ranges first; check them against the run before arming.
 
 ### SysID (servo identification for the training sim)
 
