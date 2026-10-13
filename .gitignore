@@ -219,3 +219,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Recorded policy runs (policy/trace.py); download them from the Control tab
+data/traces/

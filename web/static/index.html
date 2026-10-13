@@ -376,6 +376,22 @@
           </table>
         </div>
       </div>
+
+      <div class="ctl-card ctl-wide">
+        <h3>Run traces <span class="ctl-meta" id="ctl-trace-rec"></span></h3>
+        <div class="ctl-row"><button id="ctl-trace-refresh">Refresh</button></div>
+        <div class="table-wrapper">
+          <table id="ctl-trace-table">
+            <thead><tr>
+              <th>When (UTC)</th><th>Model</th><th>Length</th><th>Ended by</th><th>Size</th><th></th>
+            </tr></thead>
+            <tbody id="ctl-trace-tbody"><tr><td colspan="6">No traces yet.</td></tr></tbody>
+          </table>
+        </div>
+        <p class="ctl-hint">Every policy run (Start until Stop, fault, disarm or e-stop) is
+           recorded at 50&nbsp;Hz and saved under <code>data/traces/</code> as <code>.npz</code>.
+           Format: <code>policy/trace.py</code>.</p>
+      </div>
     </div>
   </div>
 

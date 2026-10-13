@@ -154,7 +154,7 @@ class ServoBusManager:
 
         # Optional per-cycle callback for closed-loop control (RL policy inference).
         # Invoked from the bus thread after state is updated, so it sees the freshest
-        # reading and its command lands on the very next SYNC_WRITE.
+        # reading, and before this cycle's SYNC_WRITE, so its command goes out immediately.
         self._policy_hook = None
 
         # Exclusive job (system identification): run ON the bus thread, between normal
@@ -458,14 +458,6 @@ class ServoBusManager:
                 servo_states = self._sync_read_all()
                 if p:
                     self._prof_t_uart_us.append((time.monotonic_ns() - t0) / 1000.0)
-
-                # --- optional SYNC_WRITE ---
-                cmd, speed = self._consume_pending()
-                if cmd:
-                    t0 = time.monotonic_ns()
-                    self._sync_write(cmd, speed)
-                    if p:
-                        self._prof_t_write_w_us.append((time.monotonic_ns() - t0) / 1000.0)
             else:
                 servo_states = {}
 
@@ -495,6 +487,19 @@ class ServoBusManager:
                 except Exception:
                     logger.exception("policy hook raised; detaching it")
                     self._policy_hook = None
+
+            # --- SYNC_WRITE, AFTER the policy hook ---
+            # The policy's command goes out in the SAME cycle it was computed, ~3 ms after
+            # the SYNC_READ it is based on. Writing before the hook (the old order) sent the
+            # PREVIOUS cycle's action, ~23 ms late: a full control step of actuation latency
+            # the policy never trained with, which shows up as a growing oscillation.
+            if self._bus.is_open:
+                cmd, speed = self._consume_pending()
+                if cmd:
+                    t0 = time.monotonic_ns()
+                    self._sync_write(cmd, speed)
+                    if p:
+                        self._prof_t_write_w_us.append((time.monotonic_ns() - t0) / 1000.0)
 
             # --- Spare time (available for NN inference between cycles) ---
             t_work_done = time.monotonic_ns()

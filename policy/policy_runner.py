@@ -18,11 +18,14 @@ is wrapped, and any failure faults rather than throws.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
 
 import numpy as np
+
+from hardware.st3215.registers import Reg
 
 from .deploy_config import DeployConfig, load_bundle
 from .observation import (
@@ -32,6 +35,7 @@ from .observation import (
 )
 from .safety import FaultReason, SafetyLimits, SafetyMonitor, tilt_from_projected_gravity
 from .state_machine import PolicyState, StateMachine
+from .trace import TraceRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,9 @@ class PolicyRunner:
         self._last_targets_deg: dict[str, float] = {}
         # Post-mortem ring: the last ~2 s of observations before a fault.
         self._trace = deque(maxlen=100)
+        # Full per-step recording of every RUNNING episode, saved to data/traces/.
+        self.traces = TraceRecorder(
+            os.path.join(os.path.dirname(os.path.abspath(models_root)), "data", "traces"))
 
     # ------------------------------------------------------------------
     # Model lifecycle
@@ -134,6 +141,46 @@ class PolicyRunner:
     # Operator commands
     # ------------------------------------------------------------------
 
+    def _audit_servo_registers(self) -> None:
+        """Read back, from the SERVOS, the registers the policy's actuator model depends on.
+
+        config/robot.yaml is what Robot.initialize() meant to write, not what the servos hold.
+        These are RAM registers: a servo that powered up after the server, or browned out,
+        is back at factory values, and the factory acceleration cap (0x55 = 50) makes the
+        servo too sluggish to follow the policy, which shows up as a growing oscillation.
+          * acceleration cap 0x55 / 0x29 != 0  -> cleared again here, then re-checked
+          * P/D/I != the bundle's requires_pid -> refuse
+          * TORQUE_LIMIT 0x30 < 1000            -> refuse (training assumed torque_scale 1.0)
+        Runs on the request thread with the bus lock taken per transfer, like the startup
+        writes. It must not hold the runner lock, or the bus thread would stall behind it.
+        """
+        req = (self.cfg.actuator or {}).get("requires_pid") if self.cfg and self.cfg.actuator else None
+        problems = []
+        for servo in self._robot._bus_manager._servos:
+            name = servo.joint_name
+            try:
+                p, d, i = servo.get_pid()
+                cap = servo.read_register(Reg.MAX_ACCELERATION, 1)[0]
+                acc = servo.read_register(Reg.ACCELERATION, 1)[0]
+                if cap or acc:
+                    logger.warning("%s: acceleration cap back (0x55=%d, 0x29=%d); clearing", name, cap, acc)
+                    servo.write_register(Reg.MAX_ACCELERATION, bytes([0]))   # 0x55 first, then 0x29
+                    servo.write_register(Reg.ACCELERATION, bytes([0]))
+                    cap = servo.read_register(Reg.MAX_ACCELERATION, 1)[0]
+                    acc = servo.read_register(Reg.ACCELERATION, 1)[0]
+                lim = int.from_bytes(servo.read_register(Reg.TORQUE_LIMIT_L, 2), "little")
+            except Exception as exc:
+                problems.append(f"{name}: register read failed ({exc})")
+                continue
+            if req and (p, d, i) != (req["p"], req["d"], req["i"]):
+                problems.append(f"{name}: servo P/D/I = {p}/{d}/{i}, bundle needs {req['p']}/{req['d']}/{req['i']}")
+            if cap or acc:
+                problems.append(f"{name}: acceleration cap will not clear (0x55={cap}, 0x29={acc})")
+            if lim < 1000:
+                problems.append(f"{name}: TORQUE_LIMIT = {lim}/1000, but the policy trained on full torque")
+        if problems:
+            raise RuntimeError("servo register audit failed -- " + "; ".join(problems))
+
     def arm(self) -> dict:
         with self._lock:
             if self.cfg is None:
@@ -142,6 +189,12 @@ class PolicyRunner:
                 raise RuntimeError(f"cannot arm from {self.sm.state.value}")
             if getattr(self._robot, "sysid_active", False):
                 raise RuntimeError("a system-identification job owns the bus; wait for it or abort it")
+
+        self._audit_servo_registers()
+
+        with self._lock:
+            if not self.sm.can(PolicyState.ARMING):
+                raise RuntimeError(f"cannot arm from {self.sm.state.value}")
             if not self._robot._bus_manager.has_velocity:
                 # Without the speed bytes obs[24:36] would be all zeros -- in-range,
                 # plausible, and wrong. Refuse rather than walk on it.
@@ -198,26 +251,47 @@ class PolicyRunner:
             self._command[:] = 0.0
             self.safety.reset()
 
+            self.traces.begin({
+                "model": self.cfg.name, "model_info": self.cfg.info,
+                "joint_names": list(self.cfg.joint_names),
+                "step_dt": self.cfg.step_dt, "action_map": self.cfg.action_map,
+                "gait_clock": self.cfg.gait_clock,
+                "limits": {"tilt_fault_rad": self.limits.tilt_fault_rad,
+                           "max_action_rate": self.limits.max_action_rate,
+                           "velocity_scale": self.limits.velocity_scale},
+                "obs_layout": self.cfg.obs_layout,
+            })
             self.sm.to(PolicyState.RUNNING, "operator")
             return self.status()
+
+    def _end_trace(self, reason: str) -> None:
+        s = self.safety.state
+        self.traces.end(reason, {"fault": s.fault, "fault_detail": s.fault_detail,
+                                 "rate_limited_steps": s.rate_limited_steps})
 
     def stop(self) -> dict:
         """Back to ARMED: stop stepping the policy but hold torque and pose."""
         with self._lock:
             if self.sm.state == PolicyState.RUNNING:
                 self.sm.to(PolicyState.ARMED, "operator stop")
+            self._end_trace("stop")
             return self.status()
 
     def disarm(self) -> dict:
         with self._lock:
             self._safe_torque_off()
             self.sm.to(PolicyState.IDLE, "operator disarm")
+            self._end_trace("disarm")
             return self.status()
 
     def estop(self) -> dict:
         """Immediate torque cut from any state. Must never fail."""
         with self._lock:
             self._safe_torque_off()
+            try:
+                self._end_trace("estop")
+            except Exception:
+                logger.exception("ending the trace failed during e-stop")
             self.safety.trigger(FaultReason.ESTOP, "operator e-stop")
             self.sm.fault_now(FaultReason.ESTOP, "operator e-stop")
             logger.warning("E-STOP engaged")
@@ -285,6 +359,7 @@ class PolicyRunner:
             logger.exception("policy step failed")
             self.sm.fault_now(FaultReason.INFERENCE_ERROR, str(exc)[:200])
             self._safe_torque_off()
+            self._end_trace(f"fault_{FaultReason.INFERENCE_ERROR}")
         finally:
             self._cycle_ms.append((time.monotonic() - t0) * 1000.0)
 
@@ -307,12 +382,15 @@ class PolicyRunner:
     def _step_running(self, rl_state, cfg, sess, command) -> None:
         frame = self._assemble_frame(rl_state, advance_phase=True, command=command)
 
+        tilt = tilt_from_projected_gravity(rl_state["projected_gravity"])
         fault = self.safety.check_observation(frame, rl_state["projected_gravity"])
         if fault:
             self._trace.append(frame.copy())
             self.sm.fault_now(fault, self.safety.state.fault_detail)
             self._safe_torque_off()
             logger.warning("FAULT %s: %s", fault, self.safety.state.fault_detail)
+            self.traces.record(frame=frame, command=command, tilt_rad=tilt)
+            self._end_trace(f"fault_{fault}")
             return
 
         obs = self._obs.push(frame)
@@ -325,8 +403,10 @@ class PolicyRunner:
         if not np.all(np.isfinite(action)):
             self.sm.fault_now(FaultReason.INFERENCE_ERROR, "non-finite action")
             self._safe_torque_off()
+            self._end_trace("fault_non_finite_action")
             return
 
+        action_raw = action.copy()
         action = self.safety.limit_action(action, self._obs.previous_action)
 
         # Affine to joint targets, then the EMA -- applied once per decimation
@@ -344,6 +424,12 @@ class PolicyRunner:
         self._last_action = action
         self._step_count += 1
         self._trace.append(frame)
+        self.traces.record(
+            frame=frame, action_raw=action_raw, action=action, targets_rad=self._filtered_targets,
+            rate_limited=float(not np.allclose(np.clip(action_raw, -1, 1), action)),
+            command=command, tilt_rad=tilt,
+            cycle_ms=self._cycle_ms[-1] if self._cycle_ms else np.nan,
+            infer_ms=self._infer_ms[-1] if self._infer_ms else np.nan)
 
         self.safety.note_cycle_time(
             self._cycle_ms[-1] / 1000.0 if self._cycle_ms else 0.0, cfg.step_dt)

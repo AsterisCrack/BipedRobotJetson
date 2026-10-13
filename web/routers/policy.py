@@ -4,8 +4,8 @@ Follows the existing router conventions: a ``_robot(request)`` accessor, Pydanti
 bodies, and plain dict responses. Goes through ``robot/`` only -- never touches
 ``hardware/`` directly (CLAUDE.md layering rule).
 
-Route ordering note: this router has no path parameters, so it does not have the
-``/scan`` vs ``/{servo_id}`` shadowing hazard the servos router does.
+Route ordering note: the only path parameter is ``/traces/{name}``, which cannot shadow
+``/traces`` (different segment count), so there is no ``/scan`` vs ``/{servo_id}``-style hazard.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 import os
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -170,3 +171,19 @@ def set_safety(body: LimitsBody, request: Request):
 def transitions(request: Request):
     """Recent state transitions -- the first thing to look at after a fall."""
     return {"transitions": _runner(request).sm.recent(30)}
+
+
+@router.get("/traces")
+def list_traces(request: Request):
+    """Recorded policy runs (data/traces/*.npz), newest first. See policy/trace.py for the format."""
+    runner = _runner(request)
+    return {"root": runner.traces.root, "recording": runner.traces.active,
+            "traces": runner.traces.list()}
+
+
+@router.get("/traces/{name}")
+def download_trace(name: str, request: Request):
+    path = _runner(request).traces.path(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"no trace named {name!r}")
+    return FileResponse(path, media_type="application/octet-stream", filename=name)

@@ -68,8 +68,13 @@ Use `robot.urdf_to_logical(leg, angles)` and `robot.logical_to_urdf(leg, angles)
 1. **SYNC_READ** (SCS instruction `0x82`) — one broadcast packet, 12 sequential responses; all servo states updated atomically
 2. Get latest IMU reading from `_IMUReaderThread` (~2 µs cache read — no I2C blocking)
 3. Update thread-safe state buffer
-4. Consume latest-wins command from command buffer
-5. **SYNC_WRITE** (SCS instruction `0x83`) if a command is pending
+4. Policy hook (RL inference), which queues its command
+5. Consume latest-wins command from command buffer
+6. **SYNC_WRITE** (SCS instruction `0x83`) if a command is pending
+
+The write comes **after** the policy hook so the action goes out in the cycle it was computed
+(~3 ms after the read). Until 2026-10-12 the write came first, so every action landed one full
+cycle (~23 ms) late. The policy never trained with that delay, and it made the robot shake and fall.
 
 The IMU runs in its own daemon thread (`_IMUReaderThread`) that reads BNO055 continuously over I2C in parallel with UART. The bus thread reads a cached value, removing the 4 ms I2C latency from the servo cycle.
 
@@ -263,6 +268,22 @@ The command is the one `PolicyRunner` hands the policy, i.e. already clamped to
 `stand_threshold` and hold the clock. That matches what the policy sees as its command input.
 `command_ranges` now comes from the run's own config (gait-table runs: vx ±0.2, vy ±0.15, wz ±1.2).
 `selftest` prints the clock mode and ranges first; check them against the run before arming.
+
+### Arm-time register audit and run traces
+
+`PolicyRunner.arm()` first reads back, from the servos themselves, the RAM registers the policy's
+servo model depends on (`_audit_servo_registers`):
+- **Acceleration cap 0x55/0x29:** cleared again if it has come back (power-up order, a brown-out).
+- **P/D/I:** must equal the bundle's `requires_pid`.
+- **TORQUE_LIMIT 0x30:** must be 1000.
+
+Arming is refused otherwise. The audit runs outside the runner lock, so the bus thread never stalls
+behind it.
+
+Every RUNNING episode is recorded at 50 Hz by `policy/trace.py`, from Start until stop, fault,
+disarm or e-stop. It is saved on a background thread to `data/traces/*.npz` (gitignored). The
+Control tab's *Run traces* card lists them for download (`GET /api/policy/traces`,
+`/api/policy/traces/{name}`). Format is in the `trace.py` docstring.
 
 ### SysID (servo identification for the training sim)
 

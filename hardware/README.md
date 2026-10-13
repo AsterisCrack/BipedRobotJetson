@@ -173,8 +173,9 @@ Each servo cycle:
 1. **SYNC_READ** all servo positions, speeds, loads, voltages, temperatures
 2. **Get cached IMU** from `_IMUReaderThread` (~2 µs, non-blocking)
 3. Atomically update the thread-safe state cache under `_state_lock`
-4. Consume the latest pending position command (latest-wins per joint)
-5. **SYNC_WRITE** if a command is pending
+4. Run the policy hook, if one is attached (it queues a command)
+5. Consume the latest pending position command (latest-wins per joint)
+6. **SYNC_WRITE** if a command is pending: this cycle's policy action, not last cycle's
 
 ```python
 from hardware.servo_bus_manager import ServoBusManager

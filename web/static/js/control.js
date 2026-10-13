@@ -160,11 +160,48 @@ function renderJoints(policy, servos) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Run traces
+// ---------------------------------------------------------------------------
+
+function fmtBytes(n) {
+  return n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} kB`;
+}
+
+async function refreshTraces() {
+  const r = await fetch('/api/policy/traces').then(x => x.json()).catch(() => null);
+  const body = $('ctl-trace-tbody');
+  if (!r || !body) return;
+  $('ctl-trace-rec').textContent = r.recording ? '● recording' : '';
+  body.replaceChildren();
+  if (!r.traces || !r.traces.length) {
+    const tr = body.insertRow(); const td = tr.insertCell();
+    td.colSpan = 6; td.textContent = 'No traces yet.';
+    return;
+  }
+  for (const t of r.traces) {
+    const tr = body.insertRow();
+    tr.insertCell().textContent = (t.modified || '').replace('T', ' ').slice(0, 19);
+    tr.insertCell().textContent = t.model || '—';
+    tr.insertCell().textContent = t.seconds != null ? `${t.seconds} s (${t.steps})` : '—';
+    tr.insertCell().textContent = t.end_reason || t.error || '—';
+    tr.insertCell().textContent = fmtBytes(t.bytes || 0);
+    const a = document.createElement('a');
+    a.href = `/api/policy/traces/${encodeURIComponent(t.name)}`;
+    a.download = t.name;
+    a.textContent = 'Download';
+    tr.insertCell().appendChild(a);
+  }
+}
+
 export function onControlTelemetry(frame) {
   const p = frame.policy;
   if (!p) return;
 
   if (p.state !== lastState) {
+    // A run just ended: its trace is being saved in the background, so list it shortly.
+    if (lastState === 'running') setTimeout(refreshTraces, 1000);
+    if (p.state === 'running') $('ctl-trace-rec').textContent = '● recording';
     lastState = p.state;
     const el = $('ctl-state');
     el.textContent = p.state;
@@ -214,6 +251,8 @@ export function onControlTelemetry(frame) {
 
 export function initControl() {
   refreshModels();
+  refreshTraces();
+  $('ctl-trace-refresh').addEventListener('click', refreshTraces);
 
   // E-STOP: fire over BOTH transports. The socket is lower latency, the REST call
   // is the one that still works if the socket has silently dropped. An e-stop
