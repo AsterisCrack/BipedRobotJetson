@@ -50,6 +50,7 @@ class IMUReading:
     accel: tuple[float, float, float] = (0.0, 0.0, 9.81)                  # m/s² (linear, no gravity)
     gyro: tuple[float, float, float] = (0.0, 0.0, 0.0)                    # rad/s
     calibration_status: int = 0                                             # 0-3 (sys calibration)
+    stamp: float | None = None  # time.monotonic() of the I2C read that produced this; None = never read
 
 
 class BNO055:
@@ -170,8 +171,10 @@ class BNO055:
                 accel=(round(ax, 3), round(ay, 3), round(az, 3)),
                 gyro=(round(gx, 4), round(gy, 4), round(gz, 4)),
                 calibration_status=self._cached_sys_cal,
+                stamp=time.monotonic(),
             )
         except Exception as exc:
+            # Cached fallback keeps its ORIGINAL stamp, so consumers can see it is stale.
             logger.warning("IMU read error: %s", exc)
 
         return self._last_reading

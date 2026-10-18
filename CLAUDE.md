@@ -137,6 +137,7 @@ Telemetry (20 Hz, separate thread)
 | `robot/config.py` | Pydantic `Settings` — merges `.env` + both YAMLs |
 | `web/websocket.py` | WS dispatcher: IK in executor, uses `robot.urdf_to_logical()` / `robot.logical_to_urdf()` |
 | `web/app.py` | FastAPI factory, lifespan (starts telemetry, mounts routes) |
+| `web/guards.py` | Motion guard: 409 / WS error for servo-moving endpoints while the policy is armed or running |
 | `tools/bus_profiler.py` | Bus timing profiler — real `ServoBusManager` harness, per-phase stats + histogram |
 | `tools/return_delay.py` | Read/zero the `RETURN_DELAY` EEPROM register on all servos |
 | `tools/servo_registers.py` | Audit/clear the acceleration cap (0x55/0x29), audit torque ceilings, step-response test |
@@ -169,9 +170,14 @@ Add it to `config/robot.yaml` under `poses:` with joint angles in **logical spac
 | `policy/deploy_config.py` | Loads/validates an exported bundle |
 | `policy/observation.py` | Pure numpy: joint permutation, 50-dim frame, history ring, gait clock |
 | `policy/policy_runner.py` | ONNX session, EMA filter, arming ramp; `step()` called per bus cycle |
-| `policy/safety.py` | Tilt fault, action-rate limit, observation sanity |
+| `policy/safety.py` | Tilt fault, action-rate limit, observation sanity, stale-sensor age (`sensor_age`) |
 | `policy/state_machine.py` | `IDLE → ARMING → ARMED → RUNNING → FAULT` |
 | `policy/selftest.py` | Dry run with torque off — **run before first arm** |
+
+**Stale sensors**: `get_rl_state()` returns `servo_stamp` (oldest per-servo reply, `time.monotonic()`),
+`servo_missing` (ids that never replied) and `imu_stamp` (last good I2C read; the cached fallback keeps its old stamp).
+RUNNING faults `stale_sensor` if the oldest is > `max_sensor_age_s` (0.15 s, ~7 missed 50 Hz cycles) or any servo is missing;
+`arm()`/`start()` refuse while a servo is missing.
 
 ### Bundle
 
@@ -238,8 +244,11 @@ exactly**, or every action executes wrongly:
 - `absolute` (v1, e.g. `walk_v1`): `target = min + (a+1)/2·(max−min)`, so `a = 0` is the limit
   midpoint.
 - `centered` (v2): `a = 0` is the default pose, `a = ±1` reach each limit.
+- `residual` (v4): `target = clamp(home + action_scale_rad·a, min, max)` with `home =
+  default_joint_pos` (a crouch) and a per-joint `action_scale_rad`. Requires `format_version >= 4`.
 
-`deploy_config.py` refuses an unknown map or a newer format (v3 is the newest; see below). A v2 bundle's
+`deploy_config.py` refuses an unknown map or a newer format: **v4 is the newest and the runtime
+refuses anything newer than v4** (see below). A v2 bundle's
 `actuator.requires_pid` (P-only: the BAM servo model has no D) is checked against
 `config/robot.yaml` in `PolicyRunner.arm()`, which is why every servo's PID is
 `{p: 32, d: 0, i: 0}`. `arm()` also refuses while a SysID job owns the bus, and both e-stop
@@ -259,7 +268,7 @@ differently from the older policies. `deploy_config.json` carries it in `gait_cl
 `ObservationBuilder._advance_phase` does this once per control step, before the frame is built,
 which is the order training uses. The rate does not depend on speed. `load_bundle` refuses a v3
 bundle with no `gait_clock`, an unknown mode, or an implausible period (0.2–5 s), and refuses
-anything newer than v3: a runtime that fell back to the old clock would hand the policy a phase it
+anything newer than v4: a runtime that fell back to the old clock would hand the policy a phase it
 never saw. Phase 0 = right-foot touchdown, `[0, 0.5)` right stance. The runtime starts at phase 0
 on `start()`; training started at a random phase, so any start phase is in-distribution.
 
@@ -268,6 +277,35 @@ The command is the one `PolicyRunner` hands the policy, i.e. already clamped to
 `stand_threshold` and hold the clock. That matches what the policy sees as its command input.
 `command_ranges` now comes from the run's own config (gait-table runs: vx ±0.2, vy ±0.15, wz ±1.2).
 `selftest` prints the clock mode and ranges first; check them against the run before arming.
+
+### Bundle format v4: residual action map, limits from the bundle
+
+v4 adds `action_map: "residual"` (above); `default_joint_pos` is then the **home pose** and
+`obs[12:24] = joint_pos − default_joint_pos`. The arming ramp goes to the bundle home
+(`_step_arming`), not to URDF zero. Training no longer uses an in-env action-rate limiter, so
+`max_action_rate` is 0/absent in current bundles.
+
+Runtime limits are derived from the bundle on every `load()`, from the **defaults** (never from
+the previous value): action-rate clip = bundle `max_action_rate` only if > 0 (clamped to 0.05..2.0), else
+`DEFAULT_MAX_ACTION_RATE` 0.5; tilt fault = `min(bundle tilt_fault_rad, 0.784)` (only ever
+tightened). Operator limits (`POST /api/policy/safety`) are range-checked: tilt 10–45°, action rate
+0.05–2.0, velocity scale 0–1 (pydantic 422, and `PolicyRunner.set_limits` raises ValueError).
+`status()` returns `limits`, `format_version`, `action_map`, `gait_clock`, `home_deg`, which the
+Control tab uses to initialise its sliders and show the one-line model summary.
+
+### Motion guard (web)
+
+While the policy is ARMING / ARMED / RUNNING (`StateMachine.is_moving()`), `Robot.policy_motion_locked()`
+is true (also while `arm()` is mid-sequence, via `PolicyRunner.arming_in_progress`: the state is
+still IDLE during the goal preload and torque enable) and `web/guards.py` makes the endpoints that move or reconfigure servos return **HTTP 409**
+(WebSocket: `{"type":"error","cmd":...}`): `POST /api/kinematics/poses/{name}`, `/home`, `/ik/{leg}`
+(execute), the servo `position`, `raw_position`, torque **enable**, `pid`, `zero`, `zero_offset`,
+`direction_sign`, `default_position`, `id`, `speed`, `accel`, `torque_limit`, `sync_positions`,
+`simulation` endpoints, and WS `set_position`, `set_pose`, `set_foot_ik`, `set_joints_fk`, `set_pid`, `set_torque`
+enable. Torque **disable** is a safety action and is never gated, nor are the policy endpoints. The
+policy's own writes go through `Robot.sync_write_positions` from the bus thread and are not gated
+(the guard lives in `web/`, not in `Robot`). IDLE and FAULT are not locked. New web endpoints that
+move servos must call `require_motion_unlocked(robot)`.
 
 ### Arm-time register audit and run traces
 
@@ -280,10 +318,27 @@ servo model depends on (`_audit_servo_registers`):
 Arming is refused otherwise. The audit runs outside the runner lock, so the bus thread never stalls
 behind it.
 
+After the audit, and **before** `enable_all_torques()`, `arm()` calls
+`Robot.preload_goal_positions()`: every servo's goal = its present position at `ARM_SPEED`, written
+directly from the request thread (bus lock per transfer, like the audit). Otherwise the goal
+registers may hold a stale goal (web Home at speed 300, or the last policy target at `RUN_SPEED` 0
+= full speed) and torque-on would make the servo chase it. If any write fails the arm is refused
+with torque still off (also refused if the cached positions are older than `max_sensor_age_s`). The same targets are also queued on the bus manager so a stale queued
+command cannot overwrite them.
+
 Every RUNNING episode is recorded at 50 Hz by `policy/trace.py`, from Start until stop, fault,
 disarm or e-stop. It is saved on a background thread to `data/traces/*.npz` (gitignored). The
 Control tab's *Run traces* card lists them for download (`GET /api/policy/traces`,
-`/api/policy/traces/{name}`). Format is in the `trace.py` docstring.
+`/api/policy/traces/{name}`). Format is in the `trace.py` docstring. `meta` (built by
+`PolicyRunner._trace_meta`) is what is needed to interpret a trace offline (re-running the policy on it
+still needs the bundle's ONNX graph and obs normalisation): format version,
+action map, `default_joint_pos`, `action_scale_rad`, joint limits (policy order, rad), history size,
+control Hz, EMA alpha/applications, gait clock, `default_position_deg` per joint from `robot.yaml`,
+the actuator block and the limits in force.
+
+`start()` (not arming) resets runtime state like a training episode: `ObservationBuilder.reset()`
+zero-fills the history, phase 0, previous action 0, filtered targets at the measured pose. Arming
+does not touch the history; `policy.selftest` seeds its history the same way (zero-fill).
 
 ### SysID (servo identification for the training sim)
 
@@ -297,10 +352,13 @@ in situ and reports hysteresis, which sets the training backlash range.
 
 ### Calibration prerequisite
 
-Isaac's standing pose is URDF zero (`default_joint_pos` is all zeros). `config/robot.yaml`
-says this robot stands at `l_hip_yaw = −33.66°`, `l_knee_joint = +134.38°`. If those offsets
-are mechanical, part of the policy's commanded range is unreachable and will be clamped.
-Verify with `python3 -m policy.selftest --model <name>` before arming.
+The policy's home pose is the bundle's `default_joint_pos`, not URDF zero: a residual (v4) bundle
+has a crouched home, centered/absolute bundles have home 0. Policy space is **logical**: a joint's
+policy angle is `radians(urdf_deg − robot.yaml default_position_deg)`, so `default_position_deg` must be
+right for every joint (`config/robot.yaml` has e.g. `l_hip_yaw = −33.66°`, `l_knee_joint = +134.38°` as
+mechanical offsets). If it is wrong, observations and targets are shifted and part of the commanded
+range is clamped. Verify with `python3 -m policy.selftest --model <name>` before arming; it prints the
+bundle home and the measured pose against it (WARN beyond 10° per joint).
 
 ## RL integration point (low-level)
 
@@ -326,6 +384,6 @@ imu = bus_manager.get_imu_state()
 bus_manager.set_target_positions(policy_output_urdf, speed=0)  # non-blocking
 ```
 
-Policy inputs/outputs are in URDF space. `default_position_deg` can normalise inputs (subtract) and denormalise outputs (add) at the policy boundary.
+Policy inputs/outputs are in **logical** space, not URDF space: `JointMapper` converts with `radians(urdf_deg − robot.yaml default_position_deg)` on the way in and `Robot.sync_write_positions(raw=False)` adds the offset back on the way out. Inside the policy, `joint_pos_rel = q − bundle default_joint_pos` (the bundle home, 0 for centered/absolute bundles).
 
 Or use the standalone `kinematics/` library directly alongside your own hardware access — it has no dependencies on `robot/` or `web/`.

@@ -15,7 +15,7 @@ import os
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,9 +45,11 @@ class CommandBody(BaseModel):
 
 
 class LimitsBody(BaseModel):
-    tilt_fault_deg: float | None = None
-    max_action_rate: float | None = None
-    velocity_scale: float | None = None
+    # Bounds mirror policy/safety.py. 45 deg is the angle the policy trained with (episodes ended
+    # there), so the tilt fault can only be tightened from it, never loosened.
+    tilt_fault_deg: float | None = Field(None, ge=10.0, le=45.0)
+    max_action_rate: float | None = Field(None, ge=0.05, le=2.0)
+    velocity_scale: float | None = Field(None, ge=0.0, le=1.0)
     max_consecutive_overruns: int | None = None
 
 
@@ -164,7 +166,10 @@ def set_safety(body: LimitsBody, request: Request):
         kw["velocity_scale"] = body.velocity_scale
     if body.max_consecutive_overruns is not None:
         kw["max_consecutive_overruns"] = body.max_consecutive_overruns
-    return runner.set_limits(**kw)
+    try:
+        return runner.set_limits(**kw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @router.get("/transitions")

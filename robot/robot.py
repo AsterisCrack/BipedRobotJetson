@@ -240,6 +240,29 @@ class Robot:
             except SerialBusError as exc:
                 logger.warning("Torque disable failed for %s: %s", servo.joint_name, exc)
 
+    def preload_goal_positions(self, urdf_deg: dict[str, float], speed: int) -> None:
+        """Write every servo's goal register directly (URDF degrees), WITHOUT touching torque.
+
+        PolicyRunner.arm() calls this with the PRESENT positions before enable_all_torques(), so a
+        stale goal left in the registers cannot make a servo jump when torque comes on. Runs on the
+        request thread with the bus lock taken per transfer, like the other direct servo writes
+        (the bus thread never sees it). Raises SerialBusError if ANY servo could not be written, in
+        which case the caller must not enable torque. Afterwards the same targets replace whatever
+        was still queued for the bus thread, so a stale queued command cannot overwrite them.
+        """
+        failed: list[str] = []
+        for name, servo in self._servos.items():
+            if name not in urdf_deg:
+                failed.append(f"{name} (no position)")
+                continue
+            try:
+                servo.set_position(urdf_deg[name], speed=speed)
+            except SerialBusError as exc:
+                failed.append(f"{name} ({exc})")
+        if failed:
+            raise SerialBusError("goal write failed for " + ", ".join(failed))
+        self._bus_manager.set_target_positions(dict(urdf_deg), speed)
+
     # ------------------------------------------------------------------
     # Motion
     # ------------------------------------------------------------------
@@ -336,6 +359,19 @@ class Robot:
         """True while a sysid job owns the bus. The policy must not arm then."""
         mgr = getattr(self, "_sysid", None)
         return mgr is not None and mgr.state != "idle"
+
+    def policy_motion_locked(self) -> bool:
+        """True while the policy owns the servos: ARMING, ARMED or RUNNING, or arm() is mid-sequence
+        (the state is still IDLE while goals are preloaded and torque is enabled).
+
+        Web endpoints that move or reconfigure servos must refuse while this holds (they would
+        race the 50 Hz policy writes, or shift calibration under a running policy). IDLE and
+        FAULT are not locked, so a torque-off robot can be driven by hand again. Never creates
+        the runner. The policy's own writes go through sync_write_positions and are not gated.
+        """
+        runner = getattr(self, "_policy", None)
+        return runner is not None and (
+            runner.sm.is_moving() or getattr(runner, "arming_in_progress", False))
 
     def attach_policy_hook(self) -> bool:
         """Route the bus thread's per-cycle callback into the policy runner."""

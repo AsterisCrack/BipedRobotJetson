@@ -223,8 +223,8 @@ ID reassignment):
 | 12 | r_ankle_pitch_joint | Right | 89.47 |
 
 `default_position_deg` is non-zero here because URDF zero on this build is not the standing
-pose (a physical horn-mounting offset) — see [RL Policy Deployment](#rl-policy-deployment)
-for why this matters when driving the robot from a policy trained with URDF zero as standing.
+pose (a physical horn-mounting offset). It defines *logical* zero (`logical = urdf − default_position_deg`),
+which is the space the policy works in — see [RL Policy Deployment](#rl-policy-deployment).
 
 Named poses are defined under `poses:` as a map of joint name → degrees:
 
@@ -347,14 +347,14 @@ All endpoints return JSON. The base URL is `http://<host>:8080`.
 | `GET` | `/api/policy/models` | List bundles found under `models/` (invalid ones included, with their error) |
 | `GET` | `/api/policy/status` | Current state, model, fault, step/timing stats |
 | `POST` | `/api/policy/load` | `{"name": "walk_v1"}` — load a bundle (only while `idle`) |
-| `POST` | `/api/policy/arm` | Torque on, ramp to standing over ~2 s |
+| `POST` | `/api/policy/arm` | Goals set to the present pose, torque on, ramp to the bundle's home pose over ~2 s |
 | `POST` | `/api/policy/start` | Hand control to the policy (only from `armed`) |
 | `POST` | `/api/policy/stop` | Stop stepping the policy, keep torque and hold pose |
 | `POST` | `/api/policy/disarm` | Torque off, back to `idle` |
 | `POST` | `/api/policy/estop` | Immediate torque cut from any state — never fails |
 | `POST` | `/api/policy/clear_fault` | Clear a latched fault, back to `idle` |
 | `POST` | `/api/policy/command` | `{"vx": 0.3, "vy": 0.0, "wz": 0.0}` — velocity command, clamped server-side |
-| `GET` / `POST` | `/api/policy/safety` | Read/set tilt limit, action-rate limit, velocity scale |
+| `GET` / `POST` | `/api/policy/safety` | Read/set tilt limit (10–45°), action-rate limit (0.05–2.0), velocity scale (0–1); out of range → 422 |
 | `GET` | `/api/policy/transitions` | Recent state-machine transitions — first place to look after a fault |
 
 ---
@@ -508,10 +508,15 @@ Prints IMU specific-force reconstruction, projected gravity, tilt, the per-joint
 robot→policy mapping, and the joint targets that *would* be commanded — nothing is written to
 the bus. Run this after any recalibration.
 
-**Calibration prerequisite:** the policy trained with URDF zero as the standing pose. If
-`default_position_deg` in `config/robot.yaml` is non-zero (see the servo table above), part of
-the policy's commanded range may be outside the URDF's mechanical limits and will be clamped.
-`selftest.py` flags any joint already outside the policy's limits.
+It also prints the bundle's format version, action map, gait clock and home pose, and (live mode)
+the measured pose against that home with a WARN for any joint more than 10° away — the arm ramp
+will move it there.
+
+**Calibration prerequisite:** the policy works in *logical* space,
+`radians(urdf_deg − default_position_deg)` from `config/robot.yaml`, and its standing/home pose is
+the bundle's `default_joint_pos` (a crouch for residual v4 bundles, 0 for centered/absolute ones) —
+not URDF zero. If `default_position_deg` is wrong, every observation and target is shifted and part
+of the commanded range may be clamped. `selftest.py` flags any joint already outside the policy's limits.
 
 ### 3. Arm and drive
 
@@ -519,7 +524,7 @@ From the Control tab, or equivalently:
 
 ```bash
 curl -X POST localhost:8080/api/policy/load  -d '{"name":"walk_v1"}' -H 'Content-Type: application/json'
-curl -X POST localhost:8080/api/policy/arm     # torque on, ramps to standing over ~2 s
+curl -X POST localhost:8080/api/policy/arm     # torque on, ramps to the bundle home pose over ~2 s
 curl -X POST localhost:8080/api/policy/start   # hands control to the policy
 curl -X POST localhost:8080/api/policy/command -d '{"vx":0.3,"vy":0,"wz":0}' -H 'Content-Type: application/json'
 ```
@@ -527,16 +532,52 @@ curl -X POST localhost:8080/api/policy/command -d '{"vx":0.3,"vy":0,"wz":0}' -H 
 Lifecycle: `IDLE → ARMING → ARMED → RUNNING`, with `FAULT` reachable from any state. `start`
 is only valid from `ARMED` — the policy never begins stepping straight from `IDLE`.
 
+Arming first writes every servo's goal = its present position (at the slow arm speed, torque
+still off), so a stale goal left in the registers cannot make a joint jump when torque comes on;
+if that write fails for any servo the arm is refused. `start` is what resets the policy's runtime
+state: history zero-filled (how every training episode starts), gait phase 0, previous action 0,
+filtered targets at the measured pose.
+
+**Motion lock:** while the policy is `arming`, `armed` or `running`, the endpoints that move or
+reconfigure servos (poses, home, IK execute, servo position/raw position/torque *enable*/PID/zero/
+default position/direction/ID/speed/accel/torque limit, sync positions, and the matching WebSocket
+commands) answer HTTP 409 (WebSocket: an `error` message). Torque *disable*, e-stop, and the policy's
+own endpoints are never locked. `idle` and `fault` are not locked.
+
 ### 4. Falls and recovery
 
 Tilt past 45° (`biped_env`'s own termination threshold — the policy has never learned to
 recover past it) cuts torque immediately and latches `FAULT`. So does an e-stop, a stale
 sensor read, a non-finite action, or a sustained loop overrun.
 
-Recovery is always operator-confirmed: `POST /api/policy/clear_fault` → `arm` → `start`. The
-arming ramp re-seeds the observation history, gait phase, previous action, and EMA filter from
-the robot's actual pose, so the first policy step after recovery is in-distribution rather than
-zero-padded. Nothing moves autonomously.
+Recovery is always operator-confirmed: `POST /api/policy/clear_fault` → `arm` → `start`. Arming
+only ramps the joints to the home pose and does not touch the observation history; `start` zero-fills
+the history and resets the gait phase, previous action and EMA filter (to the measured pose), the
+same state every training episode starts from. Nothing moves autonomously.
+
+### 5. Bundle format, action map, gait clock, traces
+
+`deploy_config.json` carries `format_version` (v4 is the newest; the runtime refuses anything newer)
+and the **action map**, which must match training exactly:
+
+| `action_map` | Bundle | `target` for action `a ∈ [−1, 1]` |
+|---|---|---|
+| `absolute` | v1 | `min + (a+1)/2 · (max−min)` (`a = 0` = limit midpoint) |
+| `centered` | v2+ | `a = 0` is `default_joint_pos`, `a = ±1` reach each limit |
+| `residual` | v4 | `clamp(home + action_scale_rad · a, min, max)`, `home = default_joint_pos` |
+
+The observation's `joint_pos_rel` is `q − default_joint_pos`. **Gait clock** (`gait_clock`): v1/v2
+`speed_proportional` (advances with commanded speed), v3+ `fixed_period` (constant rate `2π/period`,
+held while the command is below `stand_threshold`). The runtime action-rate clip is the bundle's
+`max_action_rate` only if it is > 0, otherwise 0.5; the tilt fault is `min(bundle, 0.784 rad)`.
+Both are re-derived from the defaults on every load. Current training uses no in-env limiter.
+
+Every `RUNNING` episode is saved to `data/traces/*.npz` (Control tab → *Run traces*). The `meta`
+entry holds what is needed to interpret it offline (re-running the policy still needs the bundle's ONNX
+and normalisation): format version, action map,
+home pose and per-joint scale, joint limits, history size, control rate, EMA alpha and applications,
+gait clock, per-joint `default_position_deg` from `robot.yaml`, actuator block, and the limits in
+force. Format: `policy/trace.py`.
 
 ### Sensor/hardware differences the runtime accounts for
 

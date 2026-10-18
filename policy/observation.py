@@ -11,7 +11,9 @@ The 50-dim proprio frame mirrors biped_env._get_observations exactly:
     [3:6]   gyro, body frame, rad/s
     [6:9]   projected gravity, body frame, UNIT vector (~[0,0,-1] when upright)
     [9:12]  commands [v_x, v_y, w_z]
-    [12:24] joint_pos - default_joint_pos, rad   (V2 defaults are all zero)
+    [12:24] joint_pos - default_joint_pos, rad   (default = bundle default_joint_pos: zeros, or the
+            residual map's crouched home pose; joint_pos is the policy-space angle = training's
+            URDF-frame joint angle, see JointMapper)
     [24:36] joint_vel, rad/s
     [36:48] previous action, [-1, 1]
     [48:50] [sin(gait_phase), cos(gait_phase)]
@@ -147,6 +149,11 @@ class ObservationBuilder:
         self.gait_stand_threshold = float(gc.get("stand_threshold", 0.05))
         self.step_dt = cfg.step_dt
         self.layout = cfg.obs_layout
+        # joint_pos_rel = joint_pos - default_joint_pos, as in training. Zeros for centered/absolute
+        # bundles (subtracting them is a no-op), the home pose for residual ones.
+        dflt = getattr(cfg, "default_joint_pos", None)
+        self._default_joint_pos = (np.zeros(self.action_dim) if dflt is None
+                                   else np.asarray(dflt, dtype=np.float64).copy())
 
         self._history = np.zeros((self.history_size, self.proprio_dim), dtype=np.float64)
         self._prev_action = np.zeros(self.action_dim, dtype=np.float64)
@@ -176,17 +183,16 @@ class ObservationBuilder:
     def reset(self, standing_frame: np.ndarray | None = None) -> None:
         """Clear runtime state before a run.
 
-        Isaac zero-fills history at reset, which makes the first ``history_size``
-        steps produce saturated actions -- play.py works around it by sampling
-        stochastically for the warmup. On hardware that would be an unpredictable
-        lurch, so we instead fill every slot with the current standing frame. The
-        policy then starts from a consistent, in-distribution view.
+        ``standing_frame=None`` zero-fills the history, exactly like an Isaac/MuJoCo reset: that is
+        what every training episode starts from, so it is the in-distribution start (the policy
+        has seen it millions of times). Passing a frame fills every slot with it instead; that is
+        NOT what training saw. The rate limiter bounds any large first action either way.
         """
         self._prev_action[:] = 0.0
         self._gait_phase = 0.0
         if standing_frame is None:
             self._history[:] = 0.0
-            self._primed = False
+            self._primed = True     # zeros ARE the defined start; push() rolls the first frame in
         else:
             frame = np.asarray(standing_frame, dtype=np.float64)
             if frame.shape != (self.proprio_dim,):
@@ -234,7 +240,10 @@ class ObservationBuilder:
         joint_vel_rad,
         advance_phase: bool = True,
     ) -> np.ndarray:
-        """One 50-dim proprio frame. Does NOT touch the history ring."""
+        """One 50-dim proprio frame. Does NOT touch the history ring.
+
+        ``joint_pos_rad`` is the ABSOLUTE policy-space joint angle (JointMapper output);
+        the default (home) pose is subtracted here to give obs[12:24]."""
         cmd = np.asarray(commands, dtype=np.float64)
 
         if advance_phase:
@@ -245,7 +254,7 @@ class ObservationBuilder:
             np.asarray(ang_vel_b, dtype=np.float64),             # 3
             np.asarray(projected_gravity_b, dtype=np.float64),   # 3
             cmd,                                                 # 3
-            np.asarray(joint_pos_rad, dtype=np.float64),         # 12
+            np.asarray(joint_pos_rad, dtype=np.float64) - self._default_joint_pos,  # 12
             np.asarray(joint_vel_rad, dtype=np.float64),         # 12
             self._prev_action,                                   # 12
             np.array([math.sin(self._gait_phase),

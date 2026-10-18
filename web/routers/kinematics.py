@@ -3,6 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from web.guards import require_motion_unlocked
+
 router = APIRouter()
 
 
@@ -46,6 +48,8 @@ def forward_kinematics_from_angles(leg: str, cmd: FKCmd, request: Request) -> di
 def inverse_kinematics(leg: str, cmd: IKCmd, request: Request) -> dict:
     _validate_leg(leg)
     robot = _robot(request)
+    if cmd.execute:
+        require_motion_unlocked(robot)     # execute=False only computes; it moves nothing
     result = (
         robot.set_foot_position(leg, cmd.x, cmd.y, cmd.z)
         if cmd.execute
@@ -76,6 +80,7 @@ def get_pose(name: str, request: Request) -> dict:
 @router.post("/poses/{name}")
 def execute_pose(name: str, request: Request):
     robot = _robot(request)
+    require_motion_unlocked(robot)
     try:
         robot.go_to_pose(name)
         return {"ok": True, "pose": name}
@@ -86,6 +91,7 @@ def execute_pose(name: str, request: Request):
 @router.post("/home")
 def go_home(request: Request):
     robot = _robot(request)
+    require_motion_unlocked(robot)
     robot.go_to_pose(robot.home_pose_name())
     return {"ok": True, "pose": robot.home_pose_name()}
 

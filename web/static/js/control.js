@@ -108,8 +108,58 @@ async function refreshModels() {
 }
 
 // ---------------------------------------------------------------------------
+// Safety limit sliders
+// ---------------------------------------------------------------------------
+
+const RAD2DEG = 180 / Math.PI;
+
+// Show the runner's real limits ({tilt_fault_deg, max_action_rate, velocity_scale}) in the sliders.
+// The tilt slider snaps to whole degrees; the label keeps the exact value.
+function applyLimits(l) {
+  if (!l) return;
+  if (l.tilt_fault_deg != null) {
+    $('ctl-lim-tilt').value = l.tilt_fault_deg;
+    $('ctl-lim-tilt-val').textContent = Number(l.tilt_fault_deg.toFixed(1));
+  }
+  if (l.max_action_rate != null) {
+    $('ctl-lim-rate').value = l.max_action_rate;
+    $('ctl-lim-rate-val').textContent = l.max_action_rate.toFixed(2);
+  }
+  if (l.velocity_scale != null) {
+    $('ctl-lim-scale').value = l.velocity_scale;
+    $('ctl-lim-scale-val').textContent = l.velocity_scale.toFixed(2);
+  }
+}
+
+// The sliders must start from what the runner is really using (a bundle can change it on load),
+// never from the markup defaults.
+async function refreshLimits() {
+  const r = await fetch('/api/policy/safety').then(x => x.json()).catch(() => null);
+  if (r && r.limits) applyLimits(r.limits);
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry rendering
 // ---------------------------------------------------------------------------
+
+// "v4 residual | clock fixed_period 0.70 s | home hip-10 knee-26 ankle-16"
+function modelSummary(p) {
+  if (!p.model || p.format_version == null) return '';
+  const parts = [`v${p.format_version} ${p.action_map}`];
+  const gc = p.gait_clock;
+  if (gc) {
+    parts.push(gc.mode === 'fixed_period'
+      ? `clock fixed_period ${Number(gc.period).toFixed(2)} s`
+      : `clock ${gc.mode} ${Number(gc.freq).toFixed(2)} Hz/(m/s)`);
+  }
+  const h = p.home_deg || {};
+  const sgn = v => `${v > 0 ? '+' : ''}${Math.round(v)}`;
+  const named = [['hip', 'l_hip_pitch_joint'], ['knee', 'l_knee_joint'], ['ankle', 'l_ankle_pitch_joint']]
+    .filter(([, k]) => h[k] !== undefined).map(([n, k]) => `${n}${sgn(h[k])}`);
+  const allZero = Object.values(h).every(v => Math.abs(v) < 0.05);
+  parts.push(allZero ? 'home 0' : `home ${named.length ? named.join(' ') : 'custom'}`);
+  return parts.join(' | ');
+}
 
 function renderButtons(state) {
   const running = state === 'running';
@@ -228,9 +278,9 @@ export function onControlTelemetry(frame) {
   }
 
   const tilt = p.tilt_deg ?? 0;
-  const tiltMax = parseFloat($('ctl-lim-tilt').value) || 45;
+  const tiltMax = p.limits ? p.limits.tilt_fault_rad * RAD2DEG : (parseFloat($('ctl-lim-tilt').value) || 45);
   $('ctl-tilt').textContent = tilt.toFixed(1);
-  $('ctl-tilt-max').textContent = tiltMax;
+  $('ctl-tilt-max').textContent = Number(tiltMax.toFixed(1));
   const pct = Math.min(100, (tilt / tiltMax) * 100);
   const fill = $('ctl-tilt-fill');
   fill.style.width = `${pct}%`;
@@ -241,6 +291,7 @@ export function onControlTelemetry(frame) {
     $('ctl-model-meta').textContent =
       `${p.model}${info.step ? ` — step ${info.step}` : ''}${info.git_sha ? ` (${info.git_sha})` : ''}`;
   }
+  $('ctl-model-summary').textContent = modelSummary(p);
 
   renderJoints(p, frame.servos);
 }
@@ -267,6 +318,7 @@ export function initControl() {
     const name = $('ctl-model-select').value;
     if (!name) return;
     await api('load', { name });
+    refreshLimits();      // the bundle may have changed the action-rate / tilt limits
   });
 
   $('ctl-arm').addEventListener('click', () => api('arm'));
@@ -300,12 +352,12 @@ export function initControl() {
     if (keyHeld.size) { keyHeld.clear(); setSliders(0, 0, 0); }
   });
 
-  const limitPush = () => {
-    api('safety', {
-      tilt_fault_deg: parseFloat($('ctl-lim-tilt').value),
-      max_action_rate: parseFloat($('ctl-lim-rate').value),
-      velocity_scale: parseFloat($('ctl-lim-scale').value),
-    }).catch(() => {});
+  // Send ONLY the slider that changed: pushing all three would also write back whatever the
+  // other two sliders happen to show (e.g. a tilt rounded to a whole degree).
+  const limitPush = (field, id) => {
+    api('safety', { [field]: parseFloat($(id).value) })
+      .then(r => applyLimits(r.limits))
+      .catch(refreshLimits);
   };
   $('ctl-lim-tilt').addEventListener('input', e => {
     $('ctl-lim-tilt-val').textContent = e.target.value;
@@ -316,9 +368,11 @@ export function initControl() {
   $('ctl-lim-scale').addEventListener('input', e => {
     $('ctl-lim-scale-val').textContent = parseFloat(e.target.value).toFixed(2);
   });
-  ['ctl-lim-tilt', 'ctl-lim-rate', 'ctl-lim-scale'].forEach(id => {
-    $(id).addEventListener('change', limitPush);
+  [['tilt_fault_deg', 'ctl-lim-tilt'], ['max_action_rate', 'ctl-lim-rate'],
+   ['velocity_scale', 'ctl-lim-scale']].forEach(([field, id]) => {
+    $(id).addEventListener('change', () => limitPush(field, id));
   });
+  refreshLimits();
 
   fetch('/api/policy/status').then(r => r.json()).then(s => {
     if (s.state) { lastState = s.state; $('ctl-state').textContent = s.state; renderButtons(s.state); }

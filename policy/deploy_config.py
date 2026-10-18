@@ -54,8 +54,10 @@ class DeployConfig:
 
     command_ranges: dict
     tilt_fault_rad: float
-    # "absolute" (format v1, e.g. walk_v1) or "centered" (v2+). See action_to_joint_targets.
+    # "absolute" (format v1, e.g. walk_v1), "centered" (v2+) or "residual" (v4). See action_to_joint_targets.
     action_map: str = "absolute"
+    # residual only (v4): per-joint scale in rad, policy order. default_joint_pos is then the home pose.
+    action_scale_rad: np.ndarray | None = None
     # Servo model the policy was trained against (v2+), e.g. {"model": "bam", "kp_fw": 32,
     # "requires_pid": {"p": 32, "d": 0, "i": 0}, ...}. None for v1 bundles.
     actuator: dict | None = None
@@ -64,6 +66,9 @@ class DeployConfig:
     # with commanded speed (v1/v2); {"mode": "fixed_period", "period": s, "stand_threshold": m/s,
     # ...} is the gait-table clock (v3): fixed rate, held while the command is below the threshold.
     gait_clock: dict = field(default_factory=dict)
+    # Per-step action limiter the policy trained with. 0 or None = trained without a limiter
+    # (None also = bundle predates it); the runtime then keeps its safety default.
+    max_action_rate: float | None = None
     info: dict = field(default_factory=dict)
 
     @property
@@ -86,8 +91,13 @@ class DeployConfig:
           absolute  affine onto the full joint-limit box, so a = 0 is the limit MIDPOINT
           centered  a = 0 is the default pose and a = +-1 reach each limit, piecewise
                     linear on either side
+          residual  target = clip(default + action_scale_rad * a, min, max); the default is the
+                    crouched home pose (BipedEnv.actions_to_targets, format v4)
         """
         a = np.clip(action, -1.0, 1.0)
+        if self.action_map == "residual":
+            return np.clip(self.default_joint_pos + self.action_scale_rad * a,
+                           self.joint_limits_min, self.joint_limits_max)
         if self.action_map == "centered":
             span = np.where(a >= 0.0, self.joint_limits_max - self.default_joint_pos,
                             self.default_joint_pos - self.joint_limits_min)
@@ -147,12 +157,25 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     # Format v2 added the action map and servo model. Refuse anything newer than we
     # understand: a runtime that guesses the map would mis-execute every action.
     fmt = int(raw.get("format_version", 1))
-    if fmt > 3:
-        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (3)")
+    if fmt > 4:
+        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (4)")
     action_map = raw.get("action_map", "absolute" if fmt == 1 else None)
-    if action_map not in ("absolute", "centered"):
+    if action_map not in ("absolute", "centered", "residual"):
         raise ValueError(f"unknown or missing action_map {action_map!r} (format v{fmt})")
+    if action_map == "residual" and fmt < 4:
+        raise ValueError("action_map 'residual' requires format_version >= 4")
     default_pos = np.asarray(raw.get("default_joint_pos", [0.0] * action_dim), dtype=np.float64)
+    if default_pos.shape != (action_dim,) or not np.all(np.isfinite(default_pos)):
+        raise ValueError("default_joint_pos must be action_dim finite values")
+    action_scale = None
+    if action_map == "residual":
+        if "action_scale_rad" not in raw:
+            raise ValueError("residual bundle has no action_scale_rad")
+        action_scale = np.asarray(raw["action_scale_rad"], dtype=np.float64)
+        if action_scale.shape != (action_dim,) or not np.all(np.isfinite(action_scale)) or np.any(action_scale <= 0):
+            raise ValueError(f"action_scale_rad must be {action_dim} finite values > 0")
+        if np.any(default_pos >= hi) or np.any(default_pos <= lo):
+            raise ValueError("residual default_joint_pos (home) must be strictly inside the joint limits")
     if action_map == "centered" and (np.any(default_pos >= hi) or np.any(default_pos <= lo)):
         raise ValueError("centered action map needs every default_joint_pos strictly inside its limits")
 
@@ -213,9 +236,11 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
         command_ranges=raw.get("command_ranges", {}),
         tilt_fault_rad=float(raw.get("tilt_fault_rad", 0.784)),
         action_map=action_map,
+        action_scale_rad=action_scale,
         actuator=raw.get("actuator"),
         format_version=fmt,
         gait_clock=gait_clock,
+        max_action_rate=(float(raw["max_action_rate"]) if raw.get("max_action_rate") is not None else None),
         info=info,
     )
 

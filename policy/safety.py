@@ -27,6 +27,16 @@ class FaultReason:
     OPERATOR = "operator_disarm"
 
 
+# Runtime safety defaults. A bundle may tighten (never disable or loosen) them on load.
+DEFAULT_MAX_ACTION_RATE = 0.5
+DEFAULT_TILT_FAULT_RAD = 0.784   # ~45 deg, the training termination angle
+
+# Operator-settable bounds (web/routers/policy.py LimitsBody mirrors these).
+MAX_ACTION_RATE_RANGE = (0.05, 2.0)
+VELOCITY_SCALE_RANGE = (0.0, 1.0)
+TILT_FAULT_RAD_RANGE = (math.radians(10.0), math.radians(45.0))
+
+
 @dataclass
 class SafetyLimits:
     """Runtime caps applied regardless of what the policy asks for.
@@ -39,12 +49,12 @@ class SafetyLimits:
     # Tilt past which we declare a fall. Default matches biped_env._tilt_exceeded
     # (0.784 rad = 45 deg) -- the policy was terminated at this angle during
     # training, so it has never learned to recover beyond it.
-    tilt_fault_rad: float = 0.784
+    tilt_fault_rad: float = DEFAULT_TILT_FAULT_RAD
 
     # Max change in normalized action per control step. The policy trained with an
     # action-rate penalty, so large steps are already unlikely; this catches the
     # pathological case. 2.0 would be a full -1 -> +1 swing in one tick.
-    max_action_rate: float = 0.5
+    max_action_rate: float = DEFAULT_MAX_ACTION_RATE
 
     # Scales the velocity command before it reaches the observation. Lets an
     # operator dial the whole gait down without retraining.
@@ -57,6 +67,16 @@ class SafetyLimits:
     max_sensor_age_s: float = 0.15
 
 
+def sensor_age(now: float, servo_stamp: float | None, imu_stamp: float | None) -> float:
+    """Age in seconds of the OLDEST sensor feeding the observation.
+
+    A missing stamp (a sensor that has never produced data) is infinitely old.
+    """
+    if servo_stamp is None or imu_stamp is None:
+        return math.inf
+    return now - min(servo_stamp, imu_stamp)
+
+
 @dataclass
 class SafetyState:
     fault: str | None = None
@@ -66,6 +86,33 @@ class SafetyState:
     last_tilt_rad: float = 0.0
     rate_limited_steps: int = 0
     history: list = field(default_factory=list)
+
+
+def select_action_rate(bundle_rate, default: float) -> float:
+    """Runtime action-rate clip: the bundle value if > 0 (clamped to MAX_ACTION_RATE_RANGE), else ``default``.
+
+    None (old bundle) and 0 (trained without an in-env limiter) both keep the safety
+    default; a huge bundle value is clamped to the operator maximum (2.0 = a full swing per
+    step), so a bundle can tighten or loosen the clip within that range but never disable it.
+    """
+    if bundle_rate is not None and float(bundle_rate) > 0.0:
+        lo, hi = MAX_ACTION_RATE_RANGE
+        return min(max(float(bundle_rate), lo), hi)
+    return float(default)
+
+
+def select_tilt_fault(bundle_tilt, default: float = DEFAULT_TILT_FAULT_RAD) -> float:
+    """Runtime tilt fault: the bundle's value if it is tighter than ``default``, else ``default``.
+
+    Never loosened: the policy was terminated at the trained angle, so a bundle asking for a
+    larger one gets the default instead. None / non-finite / non-positive keep the default.
+    """
+    if bundle_tilt is None:
+        return float(default)
+    t = float(bundle_tilt)
+    if not math.isfinite(t) or t <= 0.0:
+        return float(default)
+    return min(t, float(default))
 
 
 def tilt_from_projected_gravity(projected_gravity_b) -> float:
@@ -117,7 +164,8 @@ class SafetyMonitor:
             return self.state.fault
 
         if sensor_age_s is not None and sensor_age_s > self.limits.max_sensor_age_s:
-            self._fault(FaultReason.STALE_SENSOR, f"{sensor_age_s * 1000:.0f} ms old")
+            self._fault(FaultReason.STALE_SENSOR, f"{sensor_age_s * 1000:.0f} ms old"
+                            if math.isfinite(sensor_age_s) else "no data yet")
             return self.state.fault
 
         return None

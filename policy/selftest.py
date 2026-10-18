@@ -73,6 +73,9 @@ def main() -> int:
     print("clock  : " + (f"fixed period {gc['period']:.3f} s, holds below {gc['stand_threshold']:.2f} m/s "
                          f"(table {gc.get('style_digest', '?')})" if gc["mode"] == "fixed_period"
                          else f"speed-proportional {gc['freq']:.2f} Hz per m/s"))
+    print(f"format : v{cfg.format_version}, action_map = {cfg.action_map}")
+    print("home   : " + " ".join(f"{n.replace('_joint', '')}={math.degrees(v):+.1f}"
+                                 for n, v in zip(cfg.joint_names, cfg.default_joint_pos)) + "  (deg)")
     print(f"ranges : {cfg.command_ranges}")
     print()
 
@@ -154,6 +157,27 @@ def main() -> int:
             failures.append(f"{name} at {log_deg:.1f} deg is outside [{lo:.0f}, {hi:.0f}]")
         print(f"{name:<24}{urdf:>10.2f}{log_deg:>13.2f}   [{lo:>5.0f},{hi:>5.0f}]{flag}")
 
+    # -- measured pose vs the bundle's home --------------------------------------
+    # Arm ramps from the measured pose to the home pose at ARM_SPEED. A big difference is not an
+    # error, but it is a big, slow motion -- know about it before arming.
+    print("\n=== measured pose vs bundle home (logical deg; nothing is moved) ===")
+    if args.synthetic:
+        print("skipped (synthetic state has no measured pose)")
+    else:
+        print(f"{'policy slot':<24}{'measured':>10}{'home':>10}{'delta':>10}")
+        far = []
+        for i, name in enumerate(cfg.joint_names):
+            meas, home = math.degrees(pos_rad[i]), math.degrees(cfg.default_joint_pos[i])
+            delta = meas - home
+            flag = ""
+            if abs(delta) > 10.0:
+                flag = "  <-- WARN"
+                far.append(f"{name} {delta:+.1f}")
+            print(f"{name:<24}{meas:>10.2f}{home:>10.2f}{delta:>+10.2f}{flag}")
+        if far:
+            print(f"{WARN} {len(far)} joint(s) are more than 10 deg from the home pose "
+                  f"({', '.join(far)}); arming will ramp them there at ARM_SPEED.")
+
     # -- inference -----------------------------------------------------------
     print("\n=== inference ===")
     import onnxruntime as ort
@@ -161,7 +185,9 @@ def main() -> int:
 
     frame = ob.build_frame(sf, gyro, pg, [0, 0, 0], pos_rad, vel_rad,
                            advance_phase=False)
-    ob.reset(standing_frame=frame)
+    # Zero-filled history, exactly like PolicyRunner.start() (and every training episode). Seeding it
+    # with copies of the standing frame is NOT what the policy was trained on.
+    ob.reset()
 
     import time
     filt = pos_rad.copy()

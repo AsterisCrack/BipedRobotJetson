@@ -9,6 +9,8 @@ import numpy as np
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from web.guards import MOTION_LOCK_MESSAGE, ws_motion_blocked
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +72,12 @@ class TelemetryBroadcaster:
         robot = self._robot
 
         try:
+            if ws_motion_blocked(robot, msg):
+                # Same shape as the other command errors. Torque disable / policy_estop never land here.
+                await ws.send_text(json.dumps(
+                    {"type": "error", "cmd": msg_type, "message": MOTION_LOCK_MESSAGE}))
+                return
+
             if msg_type == "set_position":
                 # raw=True → Debug tab (URDF space); raw=False → Servos tab (logical space)
                 servo = robot.get_servo_by_id(msg["servo_id"])

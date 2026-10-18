@@ -146,6 +146,9 @@ class ServoBusManager:
         self._servo_states_by_id: dict[int, ServoStatus] = {}
         self._imu_state: IMUReading = IMUReading()
         self._cached_positions: dict[str, float] = {}
+        # time.monotonic() of the last FRESH status merged per servo. The merge below keeps
+        # old values when a read fails, so without this a dead servo looks healthy forever.
+        self._servo_stamps: dict[int, float] = {}
 
         # --- command buffer (written by anyone, consumed by bus thread) ---
         self._cmd_lock = threading.Lock()
@@ -301,6 +304,10 @@ class ServoBusManager:
         Acquires state lock once; projected_gravity math runs outside lock.
 
         Keys:
+            servo_stamp       float | None             monotonic time of the OLDEST per-servo reply
+                                                       (None if any servo never replied)
+            servo_missing     list[int]                ids that have never replied
+            imu_stamp         float | None             monotonic time of the last good IMU read
             positions         list[float]              URDF deg in config order
             velocities        list[int]                signed speed counts (0 if fast_mode==1)
             velocities_deg_s  list[float]              URDF deg/s, direction_sign applied
@@ -314,6 +321,10 @@ class ServoBusManager:
         with self._state_lock:
             states_by_name = {s.joint_name: s for s in self._servo_states_by_id.values()}
             imu = self._imu_state
+            stamps = dict(self._servo_stamps)
+
+        servo_missing = [sid for sid in self._servo_ids if sid not in stamps]
+        servo_stamp = None if servo_missing else min(stamps.values())
 
         positions:  list[float] = []
         velocities: list[int]   = []
@@ -341,6 +352,9 @@ class ServoBusManager:
         gy, gz = _MOUNT_FLIP_YZ * gy, _MOUNT_FLIP_YZ * gz
 
         return {
+            "servo_stamp":       servo_stamp,
+            "servo_missing":     servo_missing,
+            "imu_stamp":         imu.stamp,
             "positions":         positions,
             "velocities":        velocities,
             "velocities_deg_s":  velocities_deg_s,
@@ -596,6 +610,7 @@ class ServoBusManager:
     def _update_state(
         self, servo_states: dict[int, ServoStatus], imu: IMUReading
     ) -> None:
+        now = time.monotonic()
         with self._state_lock:
             # Merge rather than replace: a cycle where some servos did not reply
             # must not drop them from the reported state, or they flicker in and
@@ -603,4 +618,5 @@ class ServoBusManager:
             for status in servo_states.values():
                 self._servo_states_by_id[status.servo_id] = status
                 self._cached_positions[status.joint_name] = status.position_deg
+                self._servo_stamps[status.servo_id] = now
             self._imu_state = imu

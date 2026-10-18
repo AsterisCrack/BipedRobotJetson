@@ -33,7 +33,10 @@ from .observation import (
     ObservationBuilder,
     specific_force_from_linear_accel,
 )
-from .safety import FaultReason, SafetyLimits, SafetyMonitor, tilt_from_projected_gravity
+from .safety import (DEFAULT_MAX_ACTION_RATE, MAX_ACTION_RATE_RANGE, TILT_FAULT_RAD_RANGE,
+                     VELOCITY_SCALE_RANGE, FaultReason, SafetyLimits, SafetyMonitor,
+                     select_action_rate, select_tilt_fault, sensor_age,
+                     tilt_from_projected_gravity)
 from .state_machine import PolicyState, StateMachine
 from .trace import TraceRecorder
 
@@ -47,6 +50,13 @@ ARM_SPEED = 200
 # Servo speed during policy execution. 0 = "as fast as the servo can", which is what
 # we want: the policy's own EMA filter is the rate limiter, not the servo's profile.
 RUN_SPEED = 0
+
+# Operator-settable limits and their allowed ranges (set_limits refuses anything outside).
+_LIMIT_RANGES = {
+    "max_action_rate": MAX_ACTION_RATE_RANGE,
+    "velocity_scale": VELOCITY_SCALE_RANGE,
+    "tilt_fault_rad": TILT_FAULT_RAD_RANGE,
+}
 
 
 class PolicyRunner:
@@ -69,6 +79,9 @@ class PolicyRunner:
         self._command = np.zeros(3, dtype=np.float64)
         self._filtered_targets: np.ndarray | None = None  # radians, policy order
         self._arm_start: np.ndarray | None = None
+        # True for the whole of arm() (audit, goal preload, torque enable, ARMING transition), so
+        # the web motion guard covers the window before the state machine reaches ARMING.
+        self._arming = False
 
         # Diagnostics
         self._infer_ms = deque(maxlen=50)
@@ -121,6 +134,7 @@ class PolicyRunner:
                     f"model returned {out.shape}, expected (1, {cfg.action_dim})")
 
             self.cfg, self._session, self._mapper, self._obs = cfg, session, mapper, obs
+            self._apply_bundle_limits(cfg)
             self._filtered_targets = None
             self._last_action = np.zeros(cfg.action_dim)
             self._infer_ms.clear()
@@ -129,6 +143,17 @@ class PolicyRunner:
             logger.info("Loaded policy %s (obs=%d act=%d @ %.0f Hz)",
                         cfg.name, cfg.obs_dim, cfg.action_dim, cfg.control_hz)
             return self.status()
+
+    def _apply_bundle_limits(self, cfg) -> None:
+        """Set the runtime limits from the bundle, always relative to the DEFAULTS.
+
+        Bundle v3+ carries the in-env limiter the policy trained with; it is used only if > 0.
+        None (old bundle) or 0 (trained without a limiter) give the default, so a bundle never
+        disables the clip, and loading a second bundle forgets the first one's value (the
+        previous value is NOT the fallback). The tilt fault only ever tightens: min(bundle, 0.784).
+        """
+        self.limits.max_action_rate = select_action_rate(cfg.max_action_rate, DEFAULT_MAX_ACTION_RATE)
+        self.limits.tilt_fault_rad = select_tilt_fault(cfg.tilt_fault_rad)
 
     def _robot_joint_names(self) -> list[str]:
         return [s.joint_name for s in self._robot._bus_manager._servos]
@@ -181,6 +206,11 @@ class PolicyRunner:
         if problems:
             raise RuntimeError("servo register audit failed -- " + "; ".join(problems))
 
+    @property
+    def arming_in_progress(self) -> bool:
+        """True while arm() is running. Part of Robot.policy_motion_locked()."""
+        return self._arming
+
     def arm(self) -> dict:
         with self._lock:
             if self.cfg is None:
@@ -189,7 +219,18 @@ class PolicyRunner:
                 raise RuntimeError(f"cannot arm from {self.sm.state.value}")
             if getattr(self._robot, "sysid_active", False):
                 raise RuntimeError("a system-identification job owns the bus; wait for it or abort it")
+            if self._arming:
+                raise RuntimeError("arm already in progress")
+            # State stays IDLE until the end of the sequence, so this flag is what keeps the web
+            # motion guard locked while goals are preloaded and torque comes on. Any failure below
+            # leaves the state IDLE and the flag is cleared in the finally.
+            self._arming = True
+        try:
+            return self._arm_sequence()
+        finally:
+            self._arming = False
 
+    def _arm_sequence(self) -> dict:
         self._audit_servo_registers()
 
         with self._lock:
@@ -226,7 +267,27 @@ class PolicyRunner:
             # Capture the pose we are ramping FROM so the ramp is smooth regardless
             # of where the robot happens to be sitting.
             rl = self._robot._bus_manager.get_rl_state()
+            if rl["servo_missing"]:
+                raise RuntimeError(f"servos never replied: {rl['servo_missing']}; check bus/power")
+            # The present positions below come from the bus thread's cache: refuse if it is stale.
+            stamp = rl.get("servo_stamp")
+            if stamp is None or time.monotonic() - stamp > self.limits.max_sensor_age_s:
+                raise RuntimeError(
+                    "servo positions are stale (no fresh bus read within "
+                    f"{self.limits.max_sensor_age_s * 1000:.0f} ms); is the bus thread running?")
             self._arm_start = self._mapper.robot_deg_to_policy_rad(rl["positions"])
+
+            # The goal registers may still hold a stale goal (a web Home at speed 300, or the last
+            # policy target at RUN_SPEED 0 = full speed), and enabling torque makes the servo chase
+            # it. So, torque still off, make every servo's goal its PRESENT position at ARM_SPEED
+            # first. Any failure refuses the arm: torque must not go on over an unknown goal.
+            try:
+                self._robot.preload_goal_positions(
+                    dict(zip(self._mapper.robot_names, rl["positions"])), ARM_SPEED)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"arm refused: could not set goal = present position before torque enable ({exc})"
+                ) from exc
 
             self._robot.enable_all_torques()
             self.sm.to(PolicyState.ARMING, "operator")
@@ -238,31 +299,51 @@ class PolicyRunner:
             if not self.sm.can(PolicyState.RUNNING):
                 raise RuntimeError(f"cannot start from {self.sm.state.value}")
 
-            # Seed every piece of runtime state from the CURRENT pose, so the first
-            # policy frame is in-distribution. Isaac zero-fills history at reset and
-            # then works around the resulting saturated actions with stochastic
-            # sampling; on hardware that would be an unpredictable lurch.
+            # Reset runtime state the way training episodes start: history zero-filled, previous
+            # action 0, filtered targets at the current pose. (Seeding the history with copies of
+            # the standing frame was a sim2real mismatch; the rate limiter bounds the first steps.)
             rl = self._robot._bus_manager.get_rl_state()
-            frame = self._assemble_frame(rl, advance_phase=False)
-            self._obs.reset(standing_frame=frame)
+            if rl["servo_missing"]:
+                raise RuntimeError(f"servos never replied: {rl['servo_missing']}; check bus/power")
+            self._obs.reset()
 
             pos_rad = self._mapper.robot_deg_to_policy_rad(rl["positions"])
             self._filtered_targets = pos_rad.copy()   # matches Isaac's reset behaviour
             self._command[:] = 0.0
             self.safety.reset()
 
-            self.traces.begin({
-                "model": self.cfg.name, "model_info": self.cfg.info,
-                "joint_names": list(self.cfg.joint_names),
-                "step_dt": self.cfg.step_dt, "action_map": self.cfg.action_map,
-                "gait_clock": self.cfg.gait_clock,
-                "limits": {"tilt_fault_rad": self.limits.tilt_fault_rad,
-                           "max_action_rate": self.limits.max_action_rate,
-                           "velocity_scale": self.limits.velocity_scale},
-                "obs_layout": self.cfg.obs_layout,
-            })
+            self.traces.begin(self._trace_meta())
             self.sm.to(PolicyState.RUNNING, "operator")
             return self.status()
+
+    def _trace_meta(self) -> dict:
+        """What is needed to INTERPRET a trace offline (units, joint order, action map, limits, offsets).
+        Re-running the policy on it still needs the bundle's ONNX graph and obs normalisation."""
+        cfg = self.cfg
+        return {
+            "model": cfg.name, "model_info": cfg.info,
+            "format_version": cfg.format_version,
+            "joint_names": list(cfg.joint_names),
+            "history_size": cfg.history_size,
+            "control_hz": cfg.control_hz,
+            "step_dt": cfg.step_dt, "action_map": cfg.action_map,
+            "gait_clock": cfg.gait_clock,
+            "action_filter_alpha": cfg.action_filter_alpha,
+            "action_filter_applications": cfg.action_filter_applications,
+            "default_joint_pos": cfg.default_joint_pos.tolist(),          # rad, policy order
+            "action_scale_rad": (None if cfg.action_scale_rad is None
+                                 else cfg.action_scale_rad.tolist()),
+            "joint_limits_min": cfg.joint_limits_min.tolist(),            # rad, policy order
+            "joint_limits_max": cfg.joint_limits_max.tolist(),
+            "command_ranges": cfg.command_ranges,
+            "actuator": cfg.actuator,
+            # URDF-space standing offsets from config/robot.yaml: logical = urdf - this.
+            "default_position_deg": self._robot_default_offsets(),
+            "limits": {"tilt_fault_rad": self.limits.tilt_fault_rad,
+                       "max_action_rate": self.limits.max_action_rate,
+                       "velocity_scale": self.limits.velocity_scale},
+            "obs_layout": cfg.obs_layout,
+        }
 
     def _end_trace(self, reason: str) -> None:
         s = self.safety.state
@@ -323,10 +404,19 @@ class PolicyRunner:
             return {"command": self._command.tolist()}
 
     def set_limits(self, **kw) -> dict:
+        """Update runtime limits. Raises ValueError (nothing applied) if any value is out of range."""
         with self._lock:
+            clean = {}
             for k, v in kw.items():
-                if v is not None and hasattr(self.limits, k):
-                    setattr(self.limits, k, float(v))
+                if v is None or not hasattr(self.limits, k):
+                    continue
+                v = float(v)
+                rng = _LIMIT_RANGES.get(k)
+                if rng is not None and not (rng[0] - 1e-9 <= v <= rng[1] + 1e-9):   # also rejects NaN
+                    raise ValueError(f"{k}={v:g} outside the allowed range [{rng[0]:g}, {rng[1]:g}]")
+                clean[k] = v
+            for k, v in clean.items():
+                setattr(self.limits, k, v)
             return self.safety_status()
 
     def _safe_torque_off(self) -> None:
@@ -364,11 +454,12 @@ class PolicyRunner:
             self._cycle_ms.append((time.monotonic() - t0) * 1000.0)
 
     def _step_arming(self, rl_state: dict) -> None:
-        """Ramp to standing (policy zero) over ARM_RAMP_S, then hold."""
+        """Ramp to the home pose (bundle default_joint_pos; zero for centered/absolute) over ARM_RAMP_S, then hold."""
         frac = min(1.0, self.sm.seconds_in_state / ARM_RAMP_S)
         # Smoothstep: zero velocity at both ends, so no jerk on entry or arrival.
         s = frac * frac * (3.0 - 2.0 * frac)
-        target = self._arm_start * (1.0 - s)  # policy zero == standing
+        home = self.cfg.default_joint_pos      # policy-space standing pose (crouched home for residual)
+        target = home + (self._arm_start - home) * (1.0 - s)
         self._write_targets(target, speed=ARM_SPEED)
 
         if frac >= 1.0:
@@ -383,7 +474,12 @@ class PolicyRunner:
         frame = self._assemble_frame(rl_state, advance_phase=True, command=command)
 
         tilt = tilt_from_projected_gravity(rl_state["projected_gravity"])
-        fault = self.safety.check_observation(frame, rl_state["projected_gravity"])
+        age = sensor_age(time.monotonic(), rl_state["servo_stamp"], rl_state["imu_stamp"])
+        fault = self.safety.check_observation(frame, rl_state["projected_gravity"], age)
+        if not fault and rl_state["servo_missing"]:
+            self.safety.trigger(FaultReason.STALE_SENSOR,
+                                f"servos never replied: {rl_state['servo_missing']}")
+            fault = self.safety.state.fault
         if fault:
             self._trace.append(frame.copy())
             self.sm.fault_now(fault, self.safety.state.fault_detail)
@@ -497,6 +593,17 @@ class PolicyRunner:
                 "cycle_ms": round(float(np.mean(self._cycle_ms)), 3) if self._cycle_ms else None,
                 "tilt_deg": round(np.degrees(self.safety.state.last_tilt_rad), 1),
                 "budget_ms": round(self.cfg.step_dt * 1000, 1) if self.cfg else None,
+                # Runtime limits as the sliders need them (rad / per-step rate / scale).
+                "limits": {"tilt_fault_rad": self.limits.tilt_fault_rad,
+                           "max_action_rate": self.limits.max_action_rate,
+                           "velocity_scale": self.limits.velocity_scale},
+                # Loaded bundle, for the control card's one-line summary.
+                "format_version": self.cfg.format_version if self.cfg else None,
+                "action_map": self.cfg.action_map if self.cfg else None,
+                "gait_clock": self.cfg.gait_clock if self.cfg else None,
+                "home_deg": ({n: round(float(np.degrees(v)), 1) for n, v in
+                              zip(self.cfg.joint_names, self.cfg.default_joint_pos)}
+                             if self.cfg else None),
             }
 
     def safety_status(self) -> dict:
