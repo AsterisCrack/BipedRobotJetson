@@ -6,12 +6,15 @@
 // WebSocket for streaming + continuous commands, fetch() for one-shot actions.
 
 import { send } from './app.js';
+import { initGamepad, gamepadSupported } from './gamepad.js';
 
 const $ = id => document.getElementById(id);
 
 let lastState = null;
 let cmdTimer = null;
 let keysEnabled = false;
+let padEnabled = false;
+let autoEnabled = false;
 const keyHeld = new Set();
 const jointRows = {};
 
@@ -62,9 +65,13 @@ function pushCommand() {
   }, 60);
 }
 
-function setSliders(vx, vy, wz) {
+function showCommand(vx, vy, wz) {
   $('ctl-vx').value = vx; $('ctl-vy').value = vy; $('ctl-wz').value = wz;
   syncCommandLabels();
+}
+
+function setSliders(vx, vy, wz) {
+  showCommand(vx, vy, wz);
   pushCommand();
 }
 
@@ -76,10 +83,186 @@ function syncCommandLabels() {
 
 function applyKeys() {
   if (!keysEnabled) return;
-  const vx = (keyHeld.has('w') ? 0.5 : 0) + (keyHeld.has('s') ? -0.3 : 0);
-  const vy = (keyHeld.has('a') ? 0.3 : 0) + (keyHeld.has('d') ? -0.3 : 0);
-  const wz = (keyHeld.has('q') ? 0.3 : 0) + (keyHeld.has('e') ? -0.3 : 0);
+  const m = maxSpeeds();
+  const vx = (keyHeld.has('w') ? m.fwd : 0) - (keyHeld.has('s') ? m.back : 0);
+  const vy = (keyHeld.has('a') ? m.lat : 0) - (keyHeld.has('d') ? m.lat : 0);
+  const wz = (keyHeld.has('q') ? m.turn : 0) - (keyHeld.has('e') ? m.turn : 0);
   setSliders(vx, vy, wz);
+}
+
+// ---------------------------------------------------------------------------
+// Command ranges + max speeds (what full stick / a held key means)
+// ---------------------------------------------------------------------------
+
+const MAX_IDS = { fwd: 'ctl-max-fwd', back: 'ctl-max-back', lat: 'ctl-max-lat', turn: 'ctl-max-turn' };
+const MAX_STORE = 'ctl-max-speeds';
+let rangesKey = '';
+
+function maxSpeeds() {
+  const m = {};
+  for (const [k, id] of Object.entries(MAX_IDS)) m[k] = parseFloat($(id).value) || 0;
+  return m;
+}
+
+function syncMaxLabels() {
+  for (const id of Object.values(MAX_IDS)) $(`${id}-val`).textContent = parseFloat($(id).value).toFixed(2);
+}
+
+function saveMaxSpeeds() {
+  try { localStorage.setItem(MAX_STORE, JSON.stringify(maxSpeeds())); } catch (_) {}
+}
+
+// Bound the command sliders and the max-speed sliders by the bundle's trained command box
+// ({lin_vel_x: [lo, hi], ...}). The server clamps anyway; this keeps the UI honest about it.
+function applyCommandRanges(r) {
+  if (!r || !r.lin_vel_x) return;
+  const key = JSON.stringify(r);
+  if (key === rangesKey) return;
+  rangesKey = key;
+
+  const setRange = (id, lo, hi) => {
+    const el = $(id);
+    el.min = lo; el.max = hi;
+    el.step = Math.max(0.005, (hi - lo) / 200).toFixed(3);
+  };
+  const [xlo, xhi] = r.lin_vel_x, [ylo, yhi] = r.lin_vel_y, [wlo, whi] = r.ang_vel_z;
+  setRange('ctl-vx', xlo, xhi);
+  setRange('ctl-vy', ylo, yhi);
+  setRange('ctl-wz', wlo, whi);
+
+  const bounds = {
+    fwd: Math.max(0, xhi), back: Math.max(0, -xlo),
+    lat: Math.max(0, -ylo, yhi), turn: Math.max(0, -wlo, whi),
+  };
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem(MAX_STORE) || '{}'); } catch (_) {}
+  for (const [k, id] of Object.entries(MAX_IDS)) {
+    const el = $(id);
+    el.min = 0; el.max = bounds[k];
+    el.step = Math.max(0.005, bounds[k] / 100).toFixed(3);
+    // A stored value from another bundle is clamped into this one's box; no stored value = full range.
+    el.value = stored[k] != null ? Math.min(stored[k], bounds[k]) : bounds[k];
+  }
+  syncMaxLabels();
+}
+
+// ---------------------------------------------------------------------------
+// Gamepad
+// ---------------------------------------------------------------------------
+
+let padConnected = null;
+
+function padStatus() {
+  const el = $('ctl-pad-status');
+  if (!gamepadSupported()) {
+    el.textContent = 'This browser has no Gamepad API.';
+  } else if (padConnected) {
+    el.textContent = `${padConnected.id.slice(0, 60)}`
+      + (padEnabled ? ' (driving)' : ' (connected, driving off; X still e-stops)');
+  } else if (!window.isSecureContext) {
+    el.textContent = 'No gamepad. Browsers may hide gamepads on plain http: open the UI through '
+      + 'an SSH tunnel (ssh -L 8080:localhost:8080 <jetson>) at http://localhost:8080.';
+  } else {
+    el.textContent = 'No gamepad. Press a button on it to connect.';
+  }
+}
+
+// E-STOP: fire over BOTH transports. The socket is lower latency, the REST call
+// is the one that still works if the socket has silently dropped. An e-stop
+// should not depend on a single channel being healthy.
+function estop() {
+  send({ type: 'policy_estop' });
+  fetch('/api/policy/estop', { method: 'POST' }).catch(() => {});
+  setSliders(0, 0, 0);
+}
+
+function onPadTick({ lx, ly, rx }) {
+  if (!padEnabled) return;
+  const m = maxSpeeds();
+  const vx = ly >= 0 ? ly * m.fwd : ly * m.back;
+  const vy = -lx * m.lat;          // stick right = move right = -y
+  const wz = -rx * m.turn;         // stick right = turn clockwise = -z
+  showCommand(vx, vy, wz);
+  // Sent every tick, even at zero: the server zeroes a streamed command that stops arriving.
+  send({ type: 'set_velocity_command', vx, vy, wz, stream: true });
+}
+
+function onPadButton(name) {
+  if (name === 'X') { estop(); return; }   // always, even with gamepad driving off
+  if (!padEnabled) return;
+  const quiet = p => p.catch(() => {});
+  if (name === 'A') {
+    if (lastState === 'idle') quiet(api('arm'));
+    else if (lastState === 'armed') quiet(api('start'));
+  } else if (name === 'B') {
+    quiet(api('stop'));
+  } else if (name === 'Y') {
+    quiet(setAuto({ enabled: !autoEnabled }));
+  } else if (name === 'View') {
+    quiet(api('disarm'));
+  }
+}
+
+function setPadEnabled(on) {
+  padEnabled = on;
+  $('ctl-pad').checked = on;
+  if (on && keysEnabled) {
+    keysEnabled = false; $('ctl-keys').checked = false; keyHeld.clear();
+  }
+  // A plain (non-stream) zero both stops the robot and clears the server's deadman.
+  if (!on) setSliders(0, 0, 0);
+  padStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Auto-recover
+// ---------------------------------------------------------------------------
+
+const AUTO_SLIDERS = [
+  ['upright_deg', 'ctl-auto-upright', v => v.toFixed(0)],
+  ['settle_s', 'ctl-auto-settle', v => v.toFixed(1)],
+  ['countdown_s', 'ctl-auto-countdown', v => v.toFixed(0)],
+];
+const AUTO_LABELS = {
+  off: 'off', watching: 'watching for falls', wait_upright: 'stand it up',
+  arming: 'arming', countdown: 'starting in',
+};
+
+function applyAutoSettings(st) {
+  if (!st || !st.settings) return;
+  for (const [key, id, fmt] of AUTO_SLIDERS) {
+    if (st.settings[key] == null) continue;
+    $(id).value = st.settings[key];
+    $(`${id}-val`).textContent = fmt(st.settings[key]);
+  }
+}
+
+async function setAuto(body) {
+  const r = await api('auto', body);
+  applyAutoSettings(r);
+  renderAuto(r);
+  return r;
+}
+
+async function refreshAuto() {
+  const r = await fetch('/api/policy/auto').then(x => (x.ok ? x.json() : null)).catch(() => null);
+  if (r) { applyAutoSettings(r); renderAuto(r); }
+}
+
+function renderAuto(a) {
+  if (!a) return;
+  autoEnabled = !!a.enabled;
+  $('ctl-auto-en').checked = autoEnabled;
+  const ph = $('ctl-auto-phase');
+  ph.textContent = AUTO_LABELS[a.phase] || a.phase;
+  ph.className = `ctl-auto-phase ctl-auto-${a.phase}`;
+  let big = '';
+  if (a.phase === 'countdown' && a.countdown_left != null) big = `${Math.ceil(a.countdown_left)}`;
+  else if (a.phase === 'wait_upright' && a.upright_s > 0 && a.settings)
+    big = `${a.upright_s.toFixed(1)} / ${a.settings.settle_s.toFixed(1)} s`;
+  $('ctl-auto-big').textContent = big;
+  $('ctl-auto-count').textContent = a.recoveries ?? 0;
+  $('ctl-auto-err').textContent = a.last_error || '';
 }
 
 // ---------------------------------------------------------------------------
@@ -148,9 +331,14 @@ function modelSummary(p) {
   const parts = [`v${p.format_version} ${p.action_map}`];
   const gc = p.gait_clock;
   if (gc) {
-    parts.push(gc.mode === 'fixed_period'
-      ? `clock fixed_period ${Number(gc.period).toFixed(2)} s`
-      : `clock ${gc.mode} ${Number(gc.freq).toFixed(2)} Hz/(m/s)`);
+    if (gc.mode === 'cadence_grid') {
+      const f = gc.freq.flat(2);
+      parts.push(`clock cadence ${(1 / Math.max(...f)).toFixed(2)}-${(1 / Math.min(...f)).toFixed(2)} s`);
+    } else {
+      parts.push(gc.mode === 'fixed_period'
+        ? `clock fixed_period ${Number(gc.period).toFixed(2)} s`
+        : `clock ${gc.mode} ${Number(gc.freq).toFixed(2)} Hz/(m/s)`);
+    }
   }
   const h = p.home_deg || {};
   const sgn = v => `${v > 0 ? '+' : ''}${Math.round(v)}`;
@@ -292,6 +480,8 @@ export function onControlTelemetry(frame) {
       `${p.model}${info.step ? ` — step ${info.step}` : ''}${info.git_sha ? ` (${info.git_sha})` : ''}`;
   }
   $('ctl-model-summary').textContent = modelSummary(p);
+  applyCommandRanges(p.command_ranges);
+  renderAuto(p.auto);
 
   renderJoints(p, frame.servos);
 }
@@ -305,14 +495,7 @@ export function initControl() {
   refreshTraces();
   $('ctl-trace-refresh').addEventListener('click', refreshTraces);
 
-  // E-STOP: fire over BOTH transports. The socket is lower latency, the REST call
-  // is the one that still works if the socket has silently dropped. An e-stop
-  // should not depend on a single channel being healthy.
-  $('ctl-estop').addEventListener('click', () => {
-    send({ type: 'policy_estop' });
-    fetch('/api/policy/estop', { method: 'POST' }).catch(() => {});
-    setSliders(0, 0, 0);
-  });
+  $('ctl-estop').addEventListener('click', estop);
 
   $('ctl-load').addEventListener('click', async () => {
     const name = $('ctl-model-select').value;
@@ -334,8 +517,39 @@ export function initControl() {
 
   $('ctl-keys').addEventListener('change', e => {
     keysEnabled = e.target.checked;
+    if (keysEnabled && padEnabled) setPadEnabled(false);
     if (!keysEnabled) { keyHeld.clear(); setSliders(0, 0, 0); }
   });
+
+  $('ctl-pad').addEventListener('change', e => setPadEnabled(e.target.checked));
+  initGamepad({
+    onTick: onPadTick,
+    onButton: onPadButton,
+    onConnection: pad => {
+      const lost = padConnected && !pad;
+      padConnected = pad;
+      if (lost && padEnabled) setSliders(0, 0, 0);   // pad unplugged mid-drive: stop now
+      padStatus();
+    },
+  });
+  padStatus();
+
+  for (const id of Object.values(MAX_IDS)) {
+    $(id).addEventListener('input', () => { syncMaxLabels(); applyKeys(); });
+    $(id).addEventListener('change', saveMaxSpeeds);
+  }
+  syncMaxLabels();
+
+  $('ctl-auto-en').addEventListener('change', e => {
+    setAuto({ enabled: e.target.checked }).catch(refreshAuto);
+  });
+  for (const [key, id, fmt] of AUTO_SLIDERS) {
+    $(id).addEventListener('input', e => { $(`${id}-val`).textContent = fmt(parseFloat(e.target.value)); });
+    $(id).addEventListener('change', e => {
+      setAuto({ [key]: parseFloat(e.target.value) }).catch(refreshAuto);
+    });
+  }
+  refreshAuto();
   window.addEventListener('keydown', e => {
     if (!keysEnabled) return;
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
@@ -376,5 +590,6 @@ export function initControl() {
 
   fetch('/api/policy/status').then(r => r.json()).then(s => {
     if (s.state) { lastState = s.state; $('ctl-state').textContent = s.state; renderButtons(s.state); }
+    applyCommandRanges(s.command_ranges);
   }).catch(() => {});
 }

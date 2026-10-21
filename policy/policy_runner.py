@@ -27,6 +27,7 @@ import numpy as np
 
 from hardware.st3215.registers import Reg
 
+from .autopilot import AutoPilot
 from .deploy_config import DeployConfig, load_bundle
 from .observation import (
     JointMapper,
@@ -50,6 +51,12 @@ ARM_SPEED = 200
 # Servo speed during policy execution. 0 = "as fast as the servo can", which is what
 # we want: the policy's own EMA filter is the rate limiter, not the servo's profile.
 RUN_SPEED = 0
+# A streamed command (gamepad) not refreshed within this many seconds is zeroed: a dropped
+# browser tab or WiFi link must not leave the robot walking on the last stick position.
+COMMAND_STREAM_TIMEOUT_S = 0.5
+# Fallback command ranges for old bundles without command_ranges.
+_DEFAULT_COMMAND_RANGES = {"lin_vel_x": (-0.3, 0.5), "lin_vel_y": (-0.3, 0.3),
+                           "ang_vel_z": (-0.3, 0.3)}
 
 # Operator-settable limits and their allowed ranges (set_limits refuses anything outside).
 _LIMIT_RANGES = {
@@ -77,6 +84,7 @@ class PolicyRunner:
         self._obs: ObservationBuilder | None = None
 
         self._command = np.zeros(3, dtype=np.float64)
+        self._command_deadline: float | None = None   # set only by streamed commands
         self._filtered_targets: np.ndarray | None = None  # radians, policy order
         self._arm_start: np.ndarray | None = None
         # True for the whole of arm() (audit, goal preload, torque enable, ARMING transition), so
@@ -94,6 +102,8 @@ class PolicyRunner:
         # Full per-step recording of every RUNNING episode, saved to data/traces/.
         self.traces = TraceRecorder(
             os.path.join(os.path.dirname(os.path.abspath(models_root)), "data", "traces"))
+        # Opt-in fall recovery (off at boot). disarm() and estop() turn it off.
+        self.auto = AutoPilot(self)
 
     # ------------------------------------------------------------------
     # Model lifecycle
@@ -359,6 +369,7 @@ class PolicyRunner:
             return self.status()
 
     def disarm(self) -> dict:
+        self.auto.disable()
         with self._lock:
             self._safe_torque_off()
             self.sm.to(PolicyState.IDLE, "operator disarm")
@@ -367,6 +378,10 @@ class PolicyRunner:
 
     def estop(self) -> dict:
         """Immediate torque cut from any state. Must never fail."""
+        try:
+            self.auto.disable("e-stop")
+        except Exception:
+            logger.exception("disabling auto-recover failed during e-stop")
         with self._lock:
             self._safe_torque_off()
             try:
@@ -378,6 +393,15 @@ class PolicyRunner:
             logger.warning("E-STOP engaged")
             return self.status()
 
+    def fault(self, reason: str, detail: str = "") -> None:
+        """Fault from outside the bus thread (auto-recover): latch, torque off, close the trace."""
+        with self._lock:
+            self.safety.trigger(reason, detail)
+            self.sm.fault_now(reason, detail)
+            self._safe_torque_off()
+            self._end_trace(f"fault_{reason}")
+            logger.warning("FAULT %s: %s", reason, detail)
+
     def clear_fault(self) -> dict:
         with self._lock:
             self._safe_torque_off()
@@ -385,22 +409,33 @@ class PolicyRunner:
             self.safety.reset()
             return self.status()
 
-    def set_command(self, vx: float, vy: float, wz: float) -> dict:
+    def command_ranges(self) -> dict:
+        """The trained command box, {key: [lo, hi]}: the bundle's, with defaults for missing keys."""
+        r = (self.cfg.command_ranges if self.cfg else None) or {}
+        return {k: [float(v) for v in r.get(k, d)] for k, d in _DEFAULT_COMMAND_RANGES.items()}
+
+    def set_command(self, vx: float, vy: float, wz: float, stream: bool = False) -> dict:
         """Velocity command, clamped server-side to the trained ranges.
 
         Never trust the client for this: the policy has only ever seen commands
         inside these ranges, and a slider bug should not be able to ask for
         something it has no idea how to do.
+
+        ``stream=True`` (gamepad) arms a deadman: unless refreshed within
+        COMMAND_STREAM_TIMEOUT_S the command is zeroed by step(). A non-stream command
+        (slider, keyboard) clears it and holds until changed.
         """
         with self._lock:
-            r = (self.cfg.command_ranges if self.cfg else {})
-            def _clamp(v, key, default):
-                lo, hi = r.get(key, default)
+            r = self.command_ranges()
+            def _clamp(v, key):
+                lo, hi = r[key]
                 return float(np.clip(v, lo, hi))
             scale = self.limits.velocity_scale
-            self._command[0] = _clamp(vx, "lin_vel_x", (-0.3, 0.5)) * scale
-            self._command[1] = _clamp(vy, "lin_vel_y", (-0.3, 0.3)) * scale
-            self._command[2] = _clamp(wz, "ang_vel_z", (-0.3, 0.3)) * scale
+            self._command[0] = _clamp(vx, "lin_vel_x") * scale
+            self._command[1] = _clamp(vy, "lin_vel_y") * scale
+            self._command[2] = _clamp(wz, "ang_vel_z") * scale
+            self._command_deadline = (time.monotonic() + COMMAND_STREAM_TIMEOUT_S
+                                      if stream else None)
             return {"command": self._command.tolist()}
 
     def set_limits(self, **kw) -> dict:
@@ -441,6 +476,10 @@ class PolicyRunner:
                 if state != PolicyState.RUNNING:
                     return
                 cfg, sess = self.cfg, self._session
+                if self._command_deadline is not None and t0 > self._command_deadline:
+                    logger.warning("streamed command timed out; zeroing it")
+                    self._command[:] = 0.0
+                    self._command_deadline = None
                 command = self._command.copy()
 
             self._step_running(rl_state, cfg, sess, command)
@@ -587,6 +626,7 @@ class PolicyRunner:
                 "fault": reason,
                 "fault_detail": detail,
                 "command": self._command.tolist(),
+                "command_ranges": self.command_ranges(),
                 "steps": self._step_count,
                 "inference_ms": round(float(np.mean(self._infer_ms)), 3) if self._infer_ms else None,
                 "inference_ms_max": round(float(np.max(self._infer_ms)), 3) if self._infer_ms else None,
@@ -631,4 +671,5 @@ class PolicyRunner:
                 "action": [round(v, 4) for v in self._last_action.tolist()],
                 "targets_deg": {k: round(v, 2) for k, v in self._last_targets_deg.items()},
                 "gait_phase": round(self._obs.gait_phase, 3) if self._obs else 0.0,
+                "auto": self.auto.status(),
             }

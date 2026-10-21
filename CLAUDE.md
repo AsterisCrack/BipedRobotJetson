@@ -169,9 +169,11 @@ Add it to `config/robot.yaml` under `poses:` with joint angles in **logical spac
 |------|------|
 | `policy/deploy_config.py` | Loads/validates an exported bundle |
 | `policy/observation.py` | Pure numpy: joint permutation, 50-dim frame, history ring, gait clock |
+| `policy/cadence.py` | Pure numpy: cadence-grid gait clock (v5), trilinear freq(cmd) + validation |
 | `policy/policy_runner.py` | ONNX session, EMA filter, arming ramp; `step()` called per bus cycle |
 | `policy/safety.py` | Tilt fault, action-rate limit, observation sanity, stale-sensor age (`sensor_age`) |
 | `policy/state_machine.py` | `IDLE → ARMING → ARMED → RUNNING → FAULT` |
+| `policy/autopilot.py` | Opt-in auto-recover after a fall (own thread): upright → re-arm → countdown → start |
 | `policy/selftest.py` | Dry run with torque off — **run before first arm** |
 
 **Stale sensors**: `get_rl_state()` returns `servo_stamp` (oldest per-servo reply, `time.monotonic()`),
@@ -247,8 +249,8 @@ exactly**, or every action executes wrongly:
 - `residual` (v4): `target = clamp(home + action_scale_rad·a, min, max)` with `home =
   default_joint_pos` (a crouch) and a per-joint `action_scale_rad`. Requires `format_version >= 4`.
 
-`deploy_config.py` refuses an unknown map or a newer format: **v4 is the newest and the runtime
-refuses anything newer than v4** (see below). A v2 bundle's
+`deploy_config.py` refuses an unknown map or a newer format: **v5 is the newest and the runtime
+refuses anything newer than v5** (see below). A v2 bundle's
 `actuator.requires_pid` (P-only: the BAM servo model has no D) is checked against
 `config/robot.yaml` in `PolicyRunner.arm()`, which is why every servo's PID is
 `{p: 32, d: 0, i: 0}`. `arm()` also refuses while a SysID job owns the bus, and both e-stop
@@ -264,11 +266,12 @@ differently from the older policies. `deploy_config.json` carries it in `gait_cl
 |---|---|---|
 | `speed_proportional` | `step_dt · 2π · freq · |v_xy|` (a zero command holds it) | v1, v2 |
 | `fixed_period` | `step_dt · 2π / period`, **only while** `|v_xy| ≥ stand_threshold` or `|wz| ≥ stand_threshold`, otherwise held | v3 |
+| `cadence_grid` | `step_dt · 2π · freq(cmd)`, held the same way (see v5 below) | v5 |
 
 `ObservationBuilder._advance_phase` does this once per control step, before the frame is built,
 which is the order training uses. The rate does not depend on speed. `load_bundle` refuses a v3
 bundle with no `gait_clock`, an unknown mode, or an implausible period (0.2–5 s), and refuses
-anything newer than v4: a runtime that fell back to the old clock would hand the policy a phase it
+anything newer than v5: a runtime that fell back to the old clock would hand the policy a phase it
 never saw. Phase 0 = right-foot touchdown, `[0, 0.5)` right stance. The runtime starts at phase 0
 on `start()`; training started at a random phase, so any start phase is in-distribution.
 
@@ -277,6 +280,23 @@ The command is the one `PolicyRunner` hands the policy, i.e. already clamped to
 `stand_threshold` and hold the clock. That matches what the policy sees as its command input.
 `command_ranges` now comes from the run's own config (gait-table runs: vx ±0.2, vy ±0.15, wz ±1.2).
 `selftest` prints the clock mode and ranges first; check them against the run before arming.
+
+### Bundle format v5: cadence-grid gait clock (cadence follows the command)
+
+Gait Studio's v2 gait tables follow human gait scaling: the cycle length depends on the command
+(about 0.9 s at 0.2 m/s and 1.8 s at 0.05 m/s for this leg; turning quickens it so one step never
+turns more than the style's `max_step_yaw`). The clock then runs at `freq(cmd)` cycles/s,
+interpolated **trilinearly in (vx, vy, wz) with each axis clamped to the grid**, the same rule as
+training (Isaac `GaitTableReference.frequency`) and sim2sim (MuJoCo `CadenceGrid`).
+`gait_clock = {"mode": "cadence_grid", "grid_vx", "grid_vy", "grid_wz", "freq": [vx][vy][wz] Hz,
+"stand_threshold", "period" (zero-command cycle, display only), "table", "style_digest", ...}`.
+
+`policy/cadence.py` holds the interpolator and its validation: strictly increasing axes, freq
+shaped to the grid, every rate inside 0.2–5 Hz. `load_bundle` refuses `cadence_grid` below format
+v5. A v5 bundle may also carry the v4 residual map. A v2 table with a constant cadence (a legacy
+fixed-period style) still exports as `fixed_period` (v3/v4). The interpolator is checked against
+`tests/data/cadence_grid_golden.json`, which is a copy of `BipedRobot/tests/data/` (regenerate both
+together).
 
 ### Bundle format v4: residual action map, limits from the bundle
 
@@ -292,6 +312,30 @@ tightened). Operator limits (`POST /api/policy/safety`) are range-checked: tilt 
 0.05–2.0, velocity scale 0–1 (pydantic 422, and `PolicyRunner.set_limits` raises ValueError).
 `status()` returns `limits`, `format_version`, `action_map`, `gait_clock`, `home_deg`, which the
 Control tab uses to initialise its sliders and show the one-line model summary.
+
+### Auto-recover and gamepad
+
+`PolicyRunner.auto` (`policy/autopilot.py`) is **off at boot** and is toggled in the Control tab
+(`GET/POST /api/policy/auto`). It recovers only a `tilt_exceeded` fault. While the robot lies there,
+it waits until the robot is upright (`< upright_deg`, gyro norm `< 0.6 rad/s`, sensors fresh) for
+`settle_s`. Then it runs clear → `attach_policy_hook` → `arm()`, and after the ramp counts down
+`countdown_s` in ARMED before `start()`. Tipping past the tilt limit during the countdown faults
+again. Any other fault, `disarm()` or `estop()` disables it (both call `auto.disable()` first). An
+ARMED reached by hand, or left by an operator Stop, is never auto-started. Three failed arms in a row
+disable it. It runs on its own thread, never the bus thread (arm does blocking bus I/O). It never
+calls the runner while holding its own lock (lock order is `runner._lock` → auto lock), and the fault
+clear re-checks under `runner._lock`, so an e-stop between decision and action always wins.
+
+The gamepad runs in the **browser** (`web/static/js/gamepad.js`, Gamepad API, standard mapping):
+- Sticks: LS = vx/vy, RS-X = wz, scaled by the Teleop card's max-speed sliders. Those sliders and the
+  command sliders are bounded by `status().command_ranges`.
+- Buttons: A arm/start, B stop, X e-stop (works even with driving off), Y toggles auto, View disarms.
+
+It sends `set_velocity_command` with `stream: true` every 50 ms. `set_command(stream=True)` arms a
+deadman: `step()` zeroes a streamed command not refreshed within `COMMAND_STREAM_TIMEOUT_S` (0.5 s),
+which covers a closed tab or a dropped WiFi link. Slider and keyboard commands are non-stream and
+hold. Browsers may expose gamepads only in a secure context, so over plain `http://<jetson>:8080`
+use an SSH tunnel to `http://localhost:8080`.
 
 ### Motion guard (web)
 

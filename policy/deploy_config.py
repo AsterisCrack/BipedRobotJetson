@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass, field
 
 import numpy as np
+from policy.cadence import CadenceGrid
 
 _REQUIRED = (
     "obs_dim", "action_dim", "history_size", "obs_proprio_dim", "obs_layout",
@@ -64,7 +65,9 @@ class DeployConfig:
     format_version: int = 1
     # Gait clock the policy was trained with. {"mode": "speed_proportional", "freq": Hz} advances
     # with commanded speed (v1/v2); {"mode": "fixed_period", "period": s, "stand_threshold": m/s,
-    # ...} is the gait-table clock (v3): fixed rate, held while the command is below the threshold.
+    # ...} is the gait-table clock (v3): fixed rate, held while the command is below the threshold;
+    # {"mode": "cadence_grid", "grid_vx/vy/wz", "freq": [vx][vy][wz] Hz, "stand_threshold", ...}
+    # (v5) runs at freq(cmd), trilinear in the command (policy/cadence.py), held the same way.
     gait_clock: dict = field(default_factory=dict)
     # Per-step action limiter the policy trained with. 0 or None = trained without a limiter
     # (None also = bundle predates it); the runtime then keeps its safety default.
@@ -157,8 +160,8 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     # Format v2 added the action map and servo model. Refuse anything newer than we
     # understand: a runtime that guesses the map would mis-execute every action.
     fmt = int(raw.get("format_version", 1))
-    if fmt > 4:
-        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (4)")
+    if fmt > 5:
+        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (5)")
     action_map = raw.get("action_map", "absolute" if fmt == 1 else None)
     if action_map not in ("absolute", "centered", "residual"):
         raise ValueError(f"unknown or missing action_map {action_map!r} (format v{fmt})")
@@ -188,7 +191,16 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
             raise ValueError("format v3 bundle has no gait_clock block")
         gait_clock = {"mode": "speed_proportional", "freq": float(raw["gait_clock_freq"])}
     mode = gait_clock.get("mode")
-    if mode == "fixed_period":
+    if mode == "cadence_grid":
+        # Format v5: the cadence follows the command. A v3/v4 runtime would run it at one rate.
+        if fmt < 5:
+            raise ValueError("gait_clock.mode 'cadence_grid' requires format_version >= 5")
+        CadenceGrid.from_gait_clock(gait_clock)          # validates axes, shape, plausible rates
+        thr = float(gait_clock.get("stand_threshold", 0.05))
+        if thr < 0.0:
+            raise ValueError("gait_clock.stand_threshold must be >= 0")
+        gait_clock = {**gait_clock, "stand_threshold": thr}
+    elif mode == "fixed_period":
         period = float(gait_clock.get("period", 0.0))
         if not (0.2 < period < 5.0):
             raise ValueError(f"gait_clock.period {period!r} s is implausible (expected 0.2-5 s)")

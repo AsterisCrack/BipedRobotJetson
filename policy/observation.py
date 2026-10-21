@@ -27,6 +27,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from policy.cadence import CadenceGrid
 
 GRAVITY = 9.81
 
@@ -147,6 +148,7 @@ class ObservationBuilder:
         self.gait_mode = gc["mode"]
         self.gait_period = float(gc.get("period", 0.0))
         self.gait_stand_threshold = float(gc.get("stand_threshold", 0.05))
+        self._cadence = CadenceGrid.from_gait_clock(gc) if self.gait_mode == "cadence_grid" else None
         self.step_dt = cfg.step_dt
         self.layout = cfg.obs_layout
         # joint_pos_rel = joint_pos - default_joint_pos, as in training. Zeros for centered/absolute
@@ -212,14 +214,18 @@ class ObservationBuilder:
         fixed_period (gait-table policies, bundle v3): constant rate 2*pi/period while the command
             is at or above stand_threshold (|v_xy| or |wz|), held otherwise. Mirrors
             BipedEnv._advance_gait_phase. Phase 0 = right-foot touchdown, [0, 0.5) right stance.
+        cadence_grid (bundle v5): the same, at 2*pi*freq(cmd) with freq trilinear in the command
+            (policy/cadence.py): the cadence follows the command, as in the v2 gait table.
         speed_proportional (v1/v2): rate proportional to commanded xy speed; zero command holds it.
         """
-        if self.gait_mode == "fixed_period":
+        if self.gait_mode in ("fixed_period", "cadence_grid"):
             thr = self.gait_stand_threshold
             moving = math.hypot(float(cmd[0]), float(cmd[1])) >= thr or abs(float(cmd[2])) >= thr
             if moving:
+                freq = (self._cadence.frequency(cmd) if self.gait_mode == "cadence_grid"
+                        else 1.0 / self.gait_period)
                 self._gait_phase = (
-                    self._gait_phase + self.step_dt * 2.0 * math.pi / self.gait_period
+                    self._gait_phase + self.step_dt * 2.0 * math.pi * freq
                 ) % (2.0 * math.pi)
         else:
             v_cmd = float(np.linalg.norm(cmd[:2]))

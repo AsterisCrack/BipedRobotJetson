@@ -53,6 +53,14 @@ class LimitsBody(BaseModel):
     max_consecutive_overruns: int | None = None
 
 
+class AutoBody(BaseModel):
+    # Bounds mirror policy/autopilot.py SETTING_RANGES.
+    enabled: bool | None = None
+    upright_deg: float | None = Field(None, ge=3.0, le=20.0)
+    settle_s: float | None = Field(None, ge=0.3, le=5.0)
+    countdown_s: float | None = Field(None, ge=1.0, le=15.0)
+
+
 @router.get("/models")
 def list_models(request: Request):
     """Discover bundles under models/. Invalid ones are listed with their error
@@ -168,6 +176,26 @@ def set_safety(body: LimitsBody, request: Request):
         kw["max_consecutive_overruns"] = body.max_consecutive_overruns
     try:
         return runner.set_limits(**kw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.get("/auto")
+def get_auto(request: Request):
+    return _runner(request).auto.status()
+
+
+@router.post("/auto")
+def set_auto(body: AutoBody, request: Request):
+    """Auto-recover after falls: settings and/or enable. Enabling attaches the policy hook so
+    a later re-arm can run even if this process never armed by hand."""
+    robot = _robot(request)
+    runner = _runner(request)
+    if body.enabled:
+        robot.attach_policy_hook()
+    try:
+        return runner.auto.configure(enabled=body.enabled, upright_deg=body.upright_deg,
+                                     settle_s=body.settle_s, countdown_s=body.countdown_s)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 

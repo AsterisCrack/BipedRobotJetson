@@ -105,11 +105,15 @@ class FakeBusManager:
         # URDF degrees in robot order: a pose 20 deg away from logical zero on every joint.
         self.positions = [OFFSETS[s.joint_name] + 20.0 for s in servos]
         self.stamp_age_s = 0.01          # age of the cached read; None = never stamped
+        self.projected_gravity = (0.0, 0.0, -1.0)   # upright
+        self.angular_vel = (0.0, 0.0, 0.0)
 
     def get_rl_state(self):
         stamp = None if self.stamp_age_s is None else time.monotonic() - self.stamp_age_s
         return {"positions": list(self.positions), "servo_missing": [], "servo_stamp": stamp,
-                "projected_gravity": (0.0, 0.0, -1.0)}
+                "imu_stamp": stamp, "projected_gravity": tuple(self.projected_gravity),
+                "angular_vel": tuple(self.angular_vel), "linear_accel": (0.0, 0.0, 0.0),
+                "velocities_deg_s": [0.0] * len(self.positions)}
 
     def set_target_positions(self, angles, speed=300):
         self.log.append(("queue", dict(angles), speed))
@@ -136,6 +140,10 @@ class FakeRobot:
 
     def sync_write_positions(self, joint_angles, speed=300, raw=False):
         self.log.append(("sync_write", dict(joint_angles), speed, raw))
+
+    def attach_policy_hook(self):
+        self.log.append(("attach_hook",))
+        return True
 
 
 def make_runner(tmp_path, monkeypatch, bundle_name="a", robot=None, **over):

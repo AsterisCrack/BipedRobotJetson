@@ -308,8 +308,36 @@
         </div>
         <div class="ctl-row"><button id="ctl-clear" class="hidden">Clear Fault</button></div>
         <p class="ctl-hint">Arm ramps to the model's home pose over ~2&nbsp;s with torque on. The policy
-           only runs after <em>Start</em>. After a fault, torque is cut and re-arming
-           is manual.</p>
+           only runs after <em>Start</em>. After a fault, torque is cut; re-arming is manual
+           unless <em>Auto-recover</em> is on.</p>
+      </div>
+
+      <div class="ctl-card">
+        <h3>Auto-recover</h3>
+        <div class="ctl-row">
+          <label class="ctl-check"><input type="checkbox" id="ctl-auto-en"> Re-arm and restart after a fall</label>
+        </div>
+        <div class="ctl-auto-status">
+          <span id="ctl-auto-phase" class="ctl-auto-phase">off</span>
+          <b id="ctl-auto-big" class="ctl-auto-big"></b>
+        </div>
+        <div class="ctl-meta">Recoveries: <span id="ctl-auto-count">0</span></div>
+        <div class="ctl-meta ctl-warn" id="ctl-auto-err"></div>
+        <div class="ctl-slider">
+          <label>Upright within <span id="ctl-auto-upright-val">8</span>°</label>
+          <input type="range" id="ctl-auto-upright" min="3" max="20" step="1" value="8">
+        </div>
+        <div class="ctl-slider">
+          <label>Held still for <span id="ctl-auto-settle-val">1.0</span> s</label>
+          <input type="range" id="ctl-auto-settle" min="0.3" max="5" step="0.1" value="1.0">
+        </div>
+        <div class="ctl-slider">
+          <label>Countdown before start <span id="ctl-auto-countdown-val">5</span> s</label>
+          <input type="range" id="ctl-auto-countdown" min="1" max="15" step="1" value="5">
+        </div>
+        <p class="ctl-hint">Only a tilt fault is recovered. Stand the robot up and hold it still:
+           it arms (2&nbsp;s ramp), counts down, then starts. Any other fault, Disarm or E-STOP
+           turns this off.</p>
       </div>
 
       <div class="ctl-card">
@@ -329,6 +357,28 @@
         <div class="ctl-row">
           <button id="ctl-zero-cmd">Zero Command</button>
           <label class="ctl-check"><input type="checkbox" id="ctl-keys"> Keyboard (WASD/QE)</label>
+          <label class="ctl-check"><input type="checkbox" id="ctl-pad"> Gamepad</label>
+        </div>
+        <div class="ctl-meta" id="ctl-pad-status">No gamepad. Press a button on it to connect.</div>
+        <p class="ctl-hint">Gamepad: left stick = forward / lateral, right stick = turn.
+           <b>A</b> arm / start, <b>B</b> stop, <b>X</b> E-STOP, <b>Y</b> toggle auto,
+           <b>View</b> disarm.</p>
+        <h3 class="ctl-sub">Max speeds (full stick / key)</h3>
+        <div class="ctl-slider">
+          <label>Forward <span id="ctl-max-fwd-val">0.00</span> m/s</label>
+          <input type="range" id="ctl-max-fwd" min="0" max="0.5" step="0.01" value="0.2">
+        </div>
+        <div class="ctl-slider">
+          <label>Backward <span id="ctl-max-back-val">0.00</span> m/s</label>
+          <input type="range" id="ctl-max-back" min="0" max="0.3" step="0.01" value="0.2">
+        </div>
+        <div class="ctl-slider">
+          <label>Lateral <span id="ctl-max-lat-val">0.00</span> m/s</label>
+          <input type="range" id="ctl-max-lat" min="0" max="0.3" step="0.01" value="0.15">
+        </div>
+        <div class="ctl-slider">
+          <label>Turn <span id="ctl-max-turn-val">0.00</span> rad/s</label>
+          <input type="range" id="ctl-max-turn" min="0" max="0.3" step="0.01" value="0.3">
         </div>
       </div>
 

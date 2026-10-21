@@ -10,6 +10,11 @@ FAULT is latched and only the operator clears it. Nothing here ever transitions
 back into motion on its own -- a robot that starts moving unprompted while someone
 has their hands near it is the failure mode worth designing hardest against.
 
+The one exception is opt-in: policy/autopilot.py (off at boot) may clear a
+*tilt* fault and drive FAULT -> IDLE -> ARMING -> ARMED -> RUNNING through the
+normal transitions once the robot has been stood upright and held still, with a
+countdown before RUNNING. Any other fault, a disarm or an e-stop turns it off.
+
 ARMING exists so torque comes on and the robot reaches standing under a slow ramp,
 rather than snapping there the instant the policy starts.
 """

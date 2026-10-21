@@ -34,6 +34,7 @@ from policy.observation import (                                  # noqa: E402
     JointMapper, ObservationBuilder, specific_force_from_linear_accel,
 )
 from policy.safety import tilt_from_projected_gravity             # noqa: E402
+from policy.cadence import CadenceGrid
 
 OK, BAD, WARN = "  OK ", " FAIL", " WARN"
 
@@ -70,9 +71,16 @@ def main() -> int:
     if cfg.info:
         print(f"source : {cfg.info.get('run','?')} step {cfg.info.get('step','?')}")
     gc = cfg.gait_clock
-    print("clock  : " + (f"fixed period {gc['period']:.3f} s, holds below {gc['stand_threshold']:.2f} m/s "
-                         f"(table {gc.get('style_digest', '?')})" if gc["mode"] == "fixed_period"
-                         else f"speed-proportional {gc['freq']:.2f} Hz per m/s"))
+    if gc["mode"] == "cadence_grid":
+        lo, hi = CadenceGrid.from_gait_clock(gc).period_range()
+        clock = (f"cadence grid, cycle {lo:.3f}-{hi:.3f} s by command, holds below "
+                 f"{gc['stand_threshold']:.2f} m/s (table {gc.get('style_digest', '?')})")
+    elif gc["mode"] == "fixed_period":
+        clock = (f"fixed period {gc['period']:.3f} s, holds below {gc['stand_threshold']:.2f} m/s "
+                 f"(table {gc.get('style_digest', '?')})")
+    else:
+        clock = f"speed-proportional {gc['freq']:.2f} Hz per m/s"
+    print("clock  : " + clock)
     print(f"format : v{cfg.format_version}, action_map = {cfg.action_map}")
     print("home   : " + " ".join(f"{n.replace('_joint', '')}={math.degrees(v):+.1f}"
                                  for n, v in zip(cfg.joint_names, cfg.default_joint_pos)) + "  (deg)")

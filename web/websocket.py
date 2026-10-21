@@ -115,6 +115,8 @@ class TelemetryBroadcaster:
                         float(msg.get("vx", 0.0)),
                         float(msg.get("vy", 0.0)),
                         float(msg.get("wz", 0.0)),
+                        # Gamepad stream: the runner zeroes it if it stops arriving.
+                        stream=bool(msg.get("stream", False)),
                     )
                     # No ack: this fires many times a second and acking each one
                     # would flood the socket for no benefit. State arrives via
