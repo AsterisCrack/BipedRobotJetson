@@ -353,7 +353,7 @@ All endpoints return JSON. The base URL is `http://<host>:8080`.
 | `POST` | `/api/policy/disarm` | Torque off, back to `idle` |
 | `POST` | `/api/policy/estop` | Immediate torque cut from any state — never fails |
 | `POST` | `/api/policy/clear_fault` | Clear a latched fault, back to `idle` |
-| `POST` | `/api/policy/command` | `{"vx": 0.3, "vy": 0.0, "wz": 0.0}` — velocity command, clamped server-side |
+| `POST` | `/api/policy/command` | `{"vx": 0.3, "vy": 0.0, "wz": 0.0}` — velocity command, limited server-side (per-axis box, or the bundle's elliptical `command_limit`); the reply has `command` (after velocity scale), `limited` and `limit_shape` |
 | `GET` / `POST` | `/api/policy/safety` | Read/set tilt limit (10–45°), action-rate limit (0.05–2.0), velocity scale (0–1); out of range → 422 |
 | `GET` | `/api/policy/transitions` | Recent state-machine transitions — first place to look after a fault |
 
@@ -413,6 +413,17 @@ that to hide itself on a machine without the dependency.
 `set_velocity_command` and `policy_estop` are also exposed as REST endpoints (`/api/policy/command`,
 `/api/policy/estop`) — the UI fires the e-stop over both transports so it does not depend on
 the socket being healthy.
+
+**Command limit.** The server never trusts the client's command. It limits it to the bundle's trained
+command region: a per-axis box from `command_ranges`, or, when `deploy_config.json` has the optional
+`command_limit` key with `"shape": "ellipse_xy"`, an ellipse in (vx, vy) with `wz` on its own box.
+An over-limit (vx, vy) is scaled back along its direction, so e.g. the corner (0.2, 0.15) with
+vx ±0.2 / vy ±0.15 becomes (0.141, 0.106) instead of the hard corner. Bundles without the key
+behave as before. A non-finite command is treated as zero. After a slider/keyboard
+`set_velocity_command` the server replies `{"type": "command_applied", "command": [vx, vy, wz],
+"shape": ...}` (the limited command, before the velocity scale) and the Control tab shows it;
+`status().command_limit_shape` reports the shape. The gamepad stream is not echoed (its stick mapping
+is already elliptical).
 
 ---
 
@@ -557,7 +568,7 @@ same state every training episode starts from. Nothing moves autonomously.
 
 ### 5. Bundle format, action map, gait clock, traces
 
-`deploy_config.json` carries `format_version` (v4 is the newest; the runtime refuses anything newer)
+`deploy_config.json` carries `format_version` (v6 is the newest; the runtime refuses anything newer)
 and the **action map**, which must match training exactly:
 
 | `action_map` | Bundle | `target` for action `a ∈ [−1, 1]` |
@@ -565,6 +576,7 @@ and the **action map**, which must match training exactly:
 | `absolute` | v1 | `min + (a+1)/2 · (max−min)` (`a = 0` = limit midpoint) |
 | `centered` | v2+ | `a = 0` is `default_joint_pos`, `a = ±1` reach each limit |
 | `residual` | v4 | `clamp(home + action_scale_rad · a, min, max)`, `home = default_joint_pos` |
+| `residual`, asymmetric scales | v6 | the same with `action_scale_pos_rad` for `a ≥ 0` and `action_scale_neg_rad` for `a < 0` (no `action_scale_rad`) |
 
 The observation's `joint_pos_rel` is `q − default_joint_pos`. **Gait clock** (`gait_clock`): v1/v2
 `speed_proportional` (advances with commanded speed), v3+ `fixed_period` (constant rate `2π/period`,

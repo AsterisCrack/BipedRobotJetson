@@ -28,6 +28,7 @@ import numpy as np
 from hardware.st3215.registers import Reg
 
 from .autopilot import AutoPilot
+from .command_limit import limit_command
 from .deploy_config import DeployConfig, load_bundle
 from .observation import (
     JointMapper,
@@ -342,10 +343,12 @@ class PolicyRunner:
             "action_filter_applications": cfg.action_filter_applications,
             "default_joint_pos": cfg.default_joint_pos.tolist(),          # rad, policy order
             "action_scale_rad": (None if cfg.action_scale_rad is None
-                                 else cfg.action_scale_rad.tolist()),
+                                 else cfg.action_scale_rad.tolist()),     # v6: the a >= 0 scale (action_scale_pos_rad)
+            **({} if cfg.action_scale_neg_rad is None else {"action_scale_neg_rad": cfg.action_scale_neg_rad.tolist()}),
             "joint_limits_min": cfg.joint_limits_min.tolist(),            # rad, policy order
             "joint_limits_max": cfg.joint_limits_max.tolist(),
             "command_ranges": cfg.command_ranges,
+            "command_limit_shape": cfg.command_limit_shape,
             "actuator": cfg.actuator,
             # URDF-space standing offsets from config/robot.yaml: logical = urdf - this.
             "default_position_deg": self._robot_default_offsets(),
@@ -414,29 +417,40 @@ class PolicyRunner:
         r = (self.cfg.command_ranges if self.cfg else None) or {}
         return {k: [float(v) for v in r.get(k, d)] for k, d in _DEFAULT_COMMAND_RANGES.items()}
 
+    def command_limit_shape(self) -> str:
+        """'box' (per-axis clamp) or 'ellipse_xy' (vx/vy inside an ellipse); 'box' if the bundle has none."""
+        return self.cfg.command_limit_shape if self.cfg else "box"
+
     def set_command(self, vx: float, vy: float, wz: float, stream: bool = False) -> dict:
-        """Velocity command, clamped server-side to the trained ranges.
+        """Velocity command, limited server-side to what the policy was trained on.
 
         Never trust the client for this: the policy has only ever seen commands
-        inside these ranges, and a slider bug should not be able to ask for
-        something it has no idea how to do.
+        inside the trained limit, and a slider bug should not be able to ask for
+        something it has no idea how to do. The limit is the bundle's ``command_limit``
+        (a box, or an ellipse in (vx, vy) with wz on its own box); without one it is the
+        per-axis box of ``command_ranges``. See policy/command_limit.py. A non-finite
+        command is refused as a zero command (NaN would pass a plain clamp).
+
+        Returns ``command`` (what the policy gets, after velocity_scale) and ``limited``
+        (the limited command before velocity_scale, i.e. what the UI should show).
 
         ``stream=True`` (gamepad) arms a deadman: unless refreshed within
         COMMAND_STREAM_TIMEOUT_S the command is zeroed by step(). A non-stream command
         (slider, keyboard) clears it and holds until changed.
         """
         with self._lock:
-            r = self.command_ranges()
-            def _clamp(v, key):
-                lo, hi = r[key]
-                return float(np.clip(v, lo, hi))
+            shape = self.command_limit_shape()
+            try:
+                limited = limit_command((vx, vy, wz), self.command_ranges(), shape)
+            except ValueError as exc:
+                logger.warning("set_command(%r, %r, %r) refused, command zeroed: %s", vx, vy, wz, exc)
+                limited = np.zeros(3, dtype=np.float64)
             scale = self.limits.velocity_scale
-            self._command[0] = _clamp(vx, "lin_vel_x") * scale
-            self._command[1] = _clamp(vy, "lin_vel_y") * scale
-            self._command[2] = _clamp(wz, "ang_vel_z") * scale
+            self._command[:] = limited * scale
             self._command_deadline = (time.monotonic() + COMMAND_STREAM_TIMEOUT_S
                                       if stream else None)
-            return {"command": self._command.tolist()}
+            return {"command": self._command.tolist(), "limited": limited.tolist(),
+                    "limit_shape": shape}
 
     def set_limits(self, **kw) -> dict:
         """Update runtime limits. Raises ValueError (nothing applied) if any value is out of range."""
@@ -627,6 +641,7 @@ class PolicyRunner:
                 "fault_detail": detail,
                 "command": self._command.tolist(),
                 "command_ranges": self.command_ranges(),
+                "command_limit_shape": self.command_limit_shape(),
                 "steps": self._step_count,
                 "inference_ms": round(float(np.mean(self._infer_ms)), 3) if self._infer_ms else None,
                 "inference_ms_max": round(float(np.max(self._infer_ms)), 3) if self._infer_ms else None,

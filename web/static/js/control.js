@@ -5,13 +5,14 @@
 //   onControlTelemetry()   called for every telemetry frame
 // WebSocket for streaming + continuous commands, fetch() for one-shot actions.
 
-import { send } from './app.js';
+import { send, on } from './app.js';
 import { initGamepad, gamepadSupported } from './gamepad.js';
 
 const $ = id => document.getElementById(id);
 
 let lastState = null;
 let cmdTimer = null;
+let cmdPending = false;   // a slider/keyboard change not yet sent: ignore server echoes meanwhile
 let keysEnabled = false;
 let padEnabled = false;
 let autoEnabled = false;
@@ -60,9 +61,30 @@ function currentCommand() {
 // flooding the socket on every pixel of slider travel.
 function pushCommand() {
   clearTimeout(cmdTimer);
+  cmdPending = true;
   cmdTimer = setTimeout(() => {
+    cmdPending = false;
     send({ type: 'set_velocity_command', ...currentCommand() });
   }, 60);
+}
+
+// The server answers a slider/keyboard command with the one its limit left (an elliptical limit
+// scales a (vx, vy) corner back along its direction). Show that, so the sliders never claim a
+// command the robot is not getting. Skipped while a newer change is waiting to be sent.
+function onCommandApplied(msg) {
+  if (cmdPending || !Array.isArray(msg.command)) return;
+  const [vx, vy, wz] = msg.command;
+  const cur = currentCommand();
+  if (Math.abs(cur.vx - vx) + Math.abs(cur.vy - vy) + Math.abs(cur.wz - wz) > 1e-6) {
+    showCommand(vx, vy, wz);
+  }
+}
+
+// "elliptical (vx, vy) limit" note under the command sliders; empty for the plain per-axis box.
+function applyLimitShape(shape) {
+  $('ctl-cmd-limit').textContent = shape === 'ellipse_xy'
+    ? 'Limit: vx and vy together stay inside an ellipse (a corner is scaled back along its direction); turn is separate.'
+    : '';
 }
 
 function showCommand(vx, vy, wz) {
@@ -481,6 +503,7 @@ export function onControlTelemetry(frame) {
   }
   $('ctl-model-summary').textContent = modelSummary(p);
   applyCommandRanges(p.command_ranges);
+  applyLimitShape(p.command_limit_shape);
   renderAuto(p.auto);
 
   renderJoints(p, frame.servos);
@@ -514,6 +537,7 @@ export function initControl() {
     $(id).addEventListener('input', () => { syncCommandLabels(); pushCommand(); });
   });
   $('ctl-zero-cmd').addEventListener('click', () => setSliders(0, 0, 0));
+  on('command_applied', onCommandApplied);
 
   $('ctl-keys').addEventListener('change', e => {
     keysEnabled = e.target.checked;
@@ -591,5 +615,6 @@ export function initControl() {
   fetch('/api/policy/status').then(r => r.json()).then(s => {
     if (s.state) { lastState = s.state; $('ctl-state').textContent = s.state; renderButtons(s.state); }
     applyCommandRanges(s.command_ranges);
+    applyLimitShape(s.command_limit_shape);
   }).catch(() => {});
 }

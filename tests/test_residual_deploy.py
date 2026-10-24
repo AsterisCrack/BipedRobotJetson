@@ -76,7 +76,7 @@ def test_parse_v4_bundle(tmp_path):
     ({"action_scale_rad": [0.0] + SCALE[1:].tolist()}, "action_scale_rad"),
     ({"action_scale_rad": None}, "action_scale_rad"),
     ({"format_version": 3}, "requires format_version >= 4"),
-    ({"format_version": 6}, "newer"),
+    ({"format_version": 7}, "newer"),
     ({"default_joint_pos": (HI + 0.1).tolist()}, "strictly inside"),
     ({"default_joint_pos": HOME[:5].tolist()}, "default_joint_pos"),
 ])

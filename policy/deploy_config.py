@@ -13,11 +13,13 @@ step -- a missing key discovered mid-gait is a fall.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 
 import numpy as np
 from policy.cadence import CadenceGrid
+from policy.command_limit import SHAPES as COMMAND_LIMIT_SHAPES
 
 _REQUIRED = (
     "obs_dim", "action_dim", "history_size", "obs_proprio_dim", "obs_layout",
@@ -25,6 +27,8 @@ _REQUIRED = (
     "obs_mean", "obs_var", "obs_epsilon", "action_filter_alpha",
     "action_filter_applications_per_step", "step_dt", "gait_clock_freq",
 )
+
+_COMMAND_AXES = ("lin_vel_x", "lin_vel_y", "ang_vel_z")
 
 
 @dataclass
@@ -58,7 +62,10 @@ class DeployConfig:
     # "absolute" (format v1, e.g. walk_v1), "centered" (v2+) or "residual" (v4). See action_to_joint_targets.
     action_map: str = "absolute"
     # residual only (v4): per-joint scale in rad, policy order. default_joint_pos is then the home pose.
+    # v6 (asymmetric): action_scale_rad holds the scale for a >= 0 (the bundle's action_scale_pos_rad) and
+    # action_scale_neg_rad the scale for a < 0; action_scale_neg_rad is None for a symmetric bundle (v4/v5).
     action_scale_rad: np.ndarray | None = None
+    action_scale_neg_rad: np.ndarray | None = None
     # Servo model the policy was trained against (v2+), e.g. {"model": "bam", "kp_fw": 32,
     # "requires_pid": {"p": 32, "d": 0, "i": 0}, ...}. None for v1 bundles.
     actuator: dict | None = None
@@ -72,7 +79,15 @@ class DeployConfig:
     # Per-step action limiter the policy trained with. 0 or None = trained without a limiter
     # (None also = bundle predates it); the runtime then keeps its safety default.
     max_action_rate: float | None = None
+    # Optional command limit (bundle key ``command_limit``): {"shape": "box" | "ellipse_xy",
+    # "lin_vel_x": [lo, hi], "lin_vel_y": [lo, hi], "ang_vel_z": [lo, hi]}, ranges resolved and
+    # validated at load. None = the bundle has none: a per-axis box from command_ranges, as before.
+    command_limit: dict | None = None
     info: dict = field(default_factory=dict)
+
+    @property
+    def command_limit_shape(self) -> str:
+        return self.command_limit["shape"] if self.command_limit else "box"
 
     @property
     def name(self) -> str:
@@ -95,17 +110,70 @@ class DeployConfig:
           centered  a = 0 is the default pose and a = +-1 reach each limit, piecewise
                     linear on either side
           residual  target = clip(default + action_scale_rad * a, min, max); the default is the
-                    crouched home pose (BipedEnv.actions_to_targets, format v4)
+                    crouched home pose (BipedEnv.actions_to_targets, format v4). Format v6 has a
+                    separate scale per side: action_scale_rad (= action_scale_pos_rad) for a >= 0 and
+                    action_scale_neg_rad for a < 0, same clip.
         """
         a = np.clip(action, -1.0, 1.0)
         if self.action_map == "residual":
-            return np.clip(self.default_joint_pos + self.action_scale_rad * a,
+            scale = (self.action_scale_rad if self.action_scale_neg_rad is None
+                     else np.where(a >= 0.0, self.action_scale_rad, self.action_scale_neg_rad))
+            return np.clip(self.default_joint_pos + scale * a,
                            self.joint_limits_min, self.joint_limits_max)
         if self.action_map == "centered":
             span = np.where(a >= 0.0, self.joint_limits_max - self.default_joint_pos,
                             self.default_joint_pos - self.joint_limits_min)
             return self.default_joint_pos + a * span
         return self.joint_limits_min + (a + 1.0) * 0.5 * self.joint_range
+
+
+def _axis_ranges(d: dict, what: str) -> dict:
+    """{lin_vel_x, lin_vel_y, ang_vel_z} -> {key: [lo, hi]} (floats): all three present, finite, lo <= hi (zero width disables an axis)."""
+    out = {}
+    for k in _COMMAND_AXES:
+        if k not in d:
+            raise ValueError(f"{what} is missing {k}")
+        try:
+            lo, hi = (float(v) for v in d[k])
+        except (TypeError, ValueError):
+            raise ValueError(f"{what}.{k} must be [lo, hi], got {d[k]!r}") from None
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise ValueError(f"{what}.{k} must be finite, got [{lo}, {hi}]")
+        if not lo <= hi:
+            raise ValueError(f"{what}.{k} needs lo <= hi, got [{lo}, {hi}]")
+        out[k] = [lo, hi]
+    return out
+
+
+def _parse_command_limit(raw_limit, raw_ranges):
+    """The optional ``command_limit`` key -> (limit dict or None, command_ranges).
+
+    Absent: (None, raw_ranges) -- nothing changes, a box from command_ranges. Present: the shape is
+    validated, its ranges fall back to command_ranges when it has none, and if both exist they must
+    agree (a bundle whose limit and command box differ is inconsistent). When it carries ranges they
+    also stand in for a missing or partial command_ranges.
+    """
+    if raw_limit is None:
+        return None, raw_ranges
+    if not isinstance(raw_limit, dict):
+        raise ValueError(f"command_limit must be an object, got {type(raw_limit).__name__}")
+    shape = raw_limit.get("shape")
+    if shape not in COMMAND_LIMIT_SHAPES:
+        raise ValueError(f"command_limit.shape {shape!r} must be one of {COMMAND_LIMIT_SHAPES}")
+    has_ranges = any(k in raw_limit for k in _COMMAND_AXES)
+    if has_ranges:
+        ranges = _axis_ranges(raw_limit, "command_limit")
+        for k in _COMMAND_AXES:
+            if k in raw_ranges and not np.allclose([float(v) for v in raw_ranges[k]], ranges[k],
+                                                   rtol=0.0, atol=1e-9):
+                raise ValueError(
+                    f"command_limit.{k} {ranges[k]} and command_ranges.{k} {list(raw_ranges[k])} "
+                    f"disagree: the bundle is inconsistent")
+    elif raw_ranges:
+        ranges = _axis_ranges(raw_ranges, "command_ranges")
+    else:
+        raise ValueError("command_limit has no ranges and the bundle has no command_ranges")
+    return {"shape": shape, **ranges}, dict(ranges)
 
 
 def load_bundle(bundle_dir: str) -> DeployConfig:
@@ -160,8 +228,8 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     # Format v2 added the action map and servo model. Refuse anything newer than we
     # understand: a runtime that guesses the map would mis-execute every action.
     fmt = int(raw.get("format_version", 1))
-    if fmt > 5:
-        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (5)")
+    if fmt > 6:
+        raise ValueError(f"bundle format_version {fmt} is newer than this runtime understands (6)")
     action_map = raw.get("action_map", "absolute" if fmt == 1 else None)
     if action_map not in ("absolute", "centered", "residual"):
         raise ValueError(f"unknown or missing action_map {action_map!r} (format v{fmt})")
@@ -170,13 +238,28 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     default_pos = np.asarray(raw.get("default_joint_pos", [0.0] * action_dim), dtype=np.float64)
     if default_pos.shape != (action_dim,) or not np.all(np.isfinite(default_pos)):
         raise ValueError("default_joint_pos must be action_dim finite values")
-    action_scale = None
+    action_scale = action_scale_neg = None
     if action_map == "residual":
-        if "action_scale_rad" not in raw:
-            raise ValueError("residual bundle has no action_scale_rad")
-        action_scale = np.asarray(raw["action_scale_rad"], dtype=np.float64)
-        if action_scale.shape != (action_dim,) or not np.all(np.isfinite(action_scale)) or np.any(action_scale <= 0):
-            raise ValueError(f"action_scale_rad must be {action_dim} finite values > 0")
+        if "action_scale_pos_rad" in raw or "action_scale_neg_rad" in raw:
+            # v6: separate scales per side (a >= 0 / a < 0); the symmetric key must not be there as well
+            if fmt < 6:
+                raise ValueError("action_scale_pos_rad / action_scale_neg_rad require format_version >= 6")
+            if "action_scale_rad" in raw:
+                raise ValueError("bundle has both action_scale_rad and action_scale_pos_rad / action_scale_neg_rad")
+            if "action_scale_pos_rad" not in raw or "action_scale_neg_rad" not in raw:
+                raise ValueError("asymmetric residual bundle needs both action_scale_pos_rad and action_scale_neg_rad")
+            sides = {}
+            for key in ("action_scale_pos_rad", "action_scale_neg_rad"):
+                sides[key] = np.asarray(raw[key], dtype=np.float64)
+                if sides[key].shape != (action_dim,) or not np.all(np.isfinite(sides[key])) or np.any(sides[key] <= 0):
+                    raise ValueError(f"{key} must be {action_dim} finite values > 0")
+            action_scale, action_scale_neg = sides["action_scale_pos_rad"], sides["action_scale_neg_rad"]
+        else:
+            if "action_scale_rad" not in raw:
+                raise ValueError("residual bundle has no action_scale_rad")
+            action_scale = np.asarray(raw["action_scale_rad"], dtype=np.float64)
+            if action_scale.shape != (action_dim,) or not np.all(np.isfinite(action_scale)) or np.any(action_scale <= 0):
+                raise ValueError(f"action_scale_rad must be {action_dim} finite values > 0")
         if np.any(default_pos >= hi) or np.any(default_pos <= lo):
             raise ValueError("residual default_joint_pos (home) must be strictly inside the joint limits")
     if action_map == "centered" and (np.any(default_pos >= hi) or np.any(default_pos <= lo)):
@@ -213,6 +296,9 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
     else:
         raise ValueError(f"unknown gait_clock.mode {mode!r}")
 
+    command_limit, command_ranges = _parse_command_limit(raw.get("command_limit"),
+                                                         raw.get("command_ranges", {}))
+
     eps = float(raw["obs_epsilon"])
     applications = int(raw["action_filter_applications_per_step"])
     if applications < 1:
@@ -245,14 +331,16 @@ def load_bundle(bundle_dir: str) -> DeployConfig:
         step_dt=step_dt,
         control_hz=float(raw.get("control_hz", round(1.0 / step_dt))),
         gait_clock_freq=float(raw["gait_clock_freq"]),
-        command_ranges=raw.get("command_ranges", {}),
+        command_ranges=command_ranges,
         tilt_fault_rad=float(raw.get("tilt_fault_rad", 0.784)),
         action_map=action_map,
         action_scale_rad=action_scale,
+        action_scale_neg_rad=action_scale_neg,
         actuator=raw.get("actuator"),
         format_version=fmt,
         gait_clock=gait_clock,
         max_action_rate=(float(raw["max_action_rate"]) if raw.get("max_action_rate") is not None else None),
+        command_limit=command_limit,
         info=info,
     )
 

@@ -81,7 +81,8 @@ def main() -> int:
     else:
         clock = f"speed-proportional {gc['freq']:.2f} Hz per m/s"
     print("clock  : " + clock)
-    print(f"format : v{cfg.format_version}, action_map = {cfg.action_map}")
+    print(f"format : v{cfg.format_version}, action_map = {cfg.action_map}"
+          + (", asymmetric action scales (+/-)" if cfg.action_scale_neg_rad is not None else ""))
     print("home   : " + " ".join(f"{n.replace('_joint', '')}={math.degrees(v):+.1f}"
                                  for n, v in zip(cfg.joint_names, cfg.default_joint_pos)) + "  (deg)")
     print(f"ranges : {cfg.command_ranges}")

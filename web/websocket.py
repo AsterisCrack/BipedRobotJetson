@@ -111,16 +111,26 @@ class TelemetryBroadcaster:
                     await ws.send_text(json.dumps(
                         {"type": "error", "message": "policy unavailable"}))
                 else:
-                    runner.set_command(
+                    stream = bool(msg.get("stream", False))
+                    applied = runner.set_command(
                         float(msg.get("vx", 0.0)),
                         float(msg.get("vy", 0.0)),
                         float(msg.get("wz", 0.0)),
                         # Gamepad stream: the runner zeroes it if it stops arriving.
-                        stream=bool(msg.get("stream", False)),
+                        stream=stream,
                     )
                     # No ack: this fires many times a second and acking each one
                     # would flood the socket for no benefit. State arrives via
-                    # the telemetry frame.
+                    # the telemetry frame. The one exception: a slider/keyboard command
+                    # (debounced, so a few per second at most) is answered with the command
+                    # the limit actually left (an ellipse can scale both axes of a corner),
+                    # so the sliders show it. The gamepad stream is already elliptical.
+                    if not stream:
+                        await ws.send_text(json.dumps({
+                            "type": "command_applied",
+                            "command": applied["limited"],
+                            "shape": applied["limit_shape"],
+                        }))
 
             elif msg_type == "policy_estop":
                 # Also exposed over the socket so the UI can cut torque without

@@ -173,6 +173,7 @@ Add it to `config/robot.yaml` under `poses:` with joint angles in **logical spac
 | `policy/policy_runner.py` | ONNX session, EMA filter, arming ramp; `step()` called per bus cycle |
 | `policy/safety.py` | Tilt fault, action-rate limit, observation sanity, stale-sensor age (`sensor_age`) |
 | `policy/state_machine.py` | `IDLE → ARMING → ARMED → RUNNING → FAULT` |
+| `policy/command_limit.py` | Pure numpy: `limit_command(cmd, ranges, shape)`, the box / elliptical (vx, vy) command limit |
 | `policy/autopilot.py` | Opt-in auto-recover after a fall (own thread): upright → re-arm → countdown → start |
 | `policy/selftest.py` | Dry run with torque off — **run before first arm** |
 
@@ -248,9 +249,16 @@ exactly**, or every action executes wrongly:
 - `centered` (v2): `a = 0` is the default pose, `a = ±1` reach each limit.
 - `residual` (v4): `target = clamp(home + action_scale_rad·a, min, max)` with `home =
   default_joint_pos` (a crouch) and a per-joint `action_scale_rad`. Requires `format_version >= 4`.
+- `residual` with asymmetric scales (v6): the same map with a separate scale per side,
+  `target = clamp(home + action_scale_pos_rad·a, min, max)` for `a >= 0` and
+  `clamp(home + action_scale_neg_rad·a, min, max)` for `a < 0` (`a = 0` is still home). The bundle then carries
+  `action_scale_pos_rad` + `action_scale_neg_rad` (12 values each, policy order) and no `action_scale_rad`; `DeployConfig`
+  holds them as `action_scale_rad` (the pos scale) and `action_scale_neg_rad` (`None` for a symmetric v4/v5 bundle, whose
+  mapping is unchanged). Training/export only emit v6 when the run's scales differ per side; "pos" is the joint angle
+  increasing above home (e.g. knee `a > 0` = toward straight).
 
-`deploy_config.py` refuses an unknown map or a newer format: **v5 is the newest and the runtime
-refuses anything newer than v5** (see below). A v2 bundle's
+`deploy_config.py` refuses an unknown map or a newer format: **v6 is the newest and the runtime
+refuses anything newer than v6** (v6 = asymmetric residual scales; v5 = cadence-grid clock; see below). A v2 bundle's
 `actuator.requires_pid` (P-only: the BAM servo model has no D) is checked against
 `config/robot.yaml` in `PolicyRunner.arm()`, which is why every servo's PID is
 `{p: 32, d: 0, i: 0}`. `arm()` also refuses while a SysID job owns the bus, and both e-stop
@@ -271,7 +279,7 @@ differently from the older policies. `deploy_config.json` carries it in `gait_cl
 `ObservationBuilder._advance_phase` does this once per control step, before the frame is built,
 which is the order training uses. The rate does not depend on speed. `load_bundle` refuses a v3
 bundle with no `gait_clock`, an unknown mode, or an implausible period (0.2–5 s), and refuses
-anything newer than v5: a runtime that fell back to the old clock would hand the policy a phase it
+anything newer than v6: a runtime that fell back to the old clock would hand the policy a phase it
 never saw. Phase 0 = right-foot touchdown, `[0, 0.5)` right stance. The runtime starts at phase 0
 on `start()`; training started at a random phase, so any start phase is in-distribution.
 
@@ -280,6 +288,20 @@ The command is the one `PolicyRunner` hands the policy, i.e. already clamped to
 `stand_threshold` and hold the clock. That matches what the policy sees as its command input.
 `command_ranges` now comes from the run's own config (gait-table runs: vx ±0.2, vy ±0.15, wz ±1.2).
 `selftest` prints the clock mode and ranges first; check them against the run before arming.
+
+**Command limit** (`policy/command_limit.py`, optional bundle key `command_limit`; no format bump).
+`{"shape": "box" | "ellipse_xy", "lin_vel_x": [lo, hi], "lin_vel_y": [lo, hi], "ang_vel_z": [lo, hi]}`.
+Absent means a per-axis box from `command_ranges`, exactly as before. `ellipse_xy` clamps the box
+first, then scales (vx, vy) back along their direction until `(vx/vx_b)² + (vy/vy_b)² <= 1`
+(`vx_b` = `hi` for vx >= 0, `-lo` otherwise, same for vy); wz keeps its own box. `deploy_config.py`
+validates it at load: the shape, three finite ranges with lo < hi, ranges falling back to
+`command_ranges` when the key has none, and an error when both exist and differ. `set_command`
+applies it, then `velocity_scale`; a non-finite command is zeroed with a warning. `status()` adds
+`command_limit_shape`, and a non-stream `set_velocity_command` is answered over the socket with
+`{"type": "command_applied", "command": [limited vx, vy, wz], "shape"}` so the sliders show what
+was applied. The function is one of three copies (training, Gait Studio, here) held together by
+`tests/data/command_limit_golden.json`; regenerate all copies together
+(`PYTHONPATH=. python tests/test_command_limit.py --regen`).
 
 ### Bundle format v5: cadence-grid gait clock (cadence follows the command)
 
@@ -328,7 +350,8 @@ clear re-checks under `runner._lock`, so an e-stop between decision and action a
 
 The gamepad runs in the **browser** (`web/static/js/gamepad.js`, Gamepad API, standard mapping):
 - Sticks: LS = vx/vy, RS-X = wz, scaled by the Teleop card's max-speed sliders. Those sliders and the
-  command sliders are bounded by `status().command_ranges`.
+  command sliders are bounded by `status().command_ranges`. With an `ellipse_xy` limit the stick
+  already gives an ellipse (radial stick x per-axis max), so its mapping is unchanged.
 - Buttons: A arm/start, B stop, X e-stop (works even with driving off), Y toggles auto, View disarms.
 
 It sends `set_velocity_command` with `stream: true` every 50 ms. `set_command(stream=True)` arms a
@@ -376,7 +399,7 @@ Control tab's *Run traces* card lists them for download (`GET /api/policy/traces
 `/api/policy/traces/{name}`). Format is in the `trace.py` docstring. `meta` (built by
 `PolicyRunner._trace_meta`) is what is needed to interpret a trace offline (re-running the policy on it
 still needs the bundle's ONNX graph and obs normalisation): format version,
-action map, `default_joint_pos`, `action_scale_rad`, joint limits (policy order, rad), history size,
+action map, `default_joint_pos`, `action_scale_rad` (+ `action_scale_neg_rad` for a v6 bundle), joint limits (policy order, rad), history size,
 control Hz, EMA alpha/applications, gait clock, `default_position_deg` per joint from `robot.yaml`,
 the actuator block and the limits in force.
 
