@@ -329,9 +329,17 @@ class ServoBusManager:
         positions:  list[float] = []
         velocities: list[int]   = []
         velocities_deg_s: list[float] = []
+        loads: list[int] = []
+        voltages: list[float] = []
+        temperatures: list[int] = []
         for servo in self._servos:          # preserves config ordering
             status = states_by_name.get(servo.joint_name)
             positions.append(status.position_deg if status else 0.0)
+            # Present load (signed, 0.1 % of max torque), supply voltage and temperature: in the SYNC_READ for
+            # fast_mode 0 (zero otherwise). Not used by the policy; recorded in the traces for sim2real analysis.
+            loads.append(status.load if status else 0)
+            voltages.append(status.voltage_v if status else 0.0)
+            temperatures.append(status.temperature_c if status else 0)
             velocities.append(status.speed       if status else 0)
             velocities_deg_s.append(
                 servo.steps_per_s_to_deg_per_s(status.speed) if status else 0.0
@@ -358,6 +366,9 @@ class ServoBusManager:
             "positions":         positions,
             "velocities":        velocities,
             "velocities_deg_s":  velocities_deg_s,
+            "loads":             loads,
+            "voltages":          voltages,
+            "temperatures":      temperatures,
             "linear_accel":      imu.accel,
             "specific_force":    imu.accel_raw,   # None unless hardware.imu_raw_accel
             "angular_vel":       imu.gyro,
