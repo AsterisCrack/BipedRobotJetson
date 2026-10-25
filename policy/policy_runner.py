@@ -594,8 +594,13 @@ class PolicyRunner:
 
         # The BNO055 reports gravity-REMOVED linear acceleration; the policy trained
         # on specific force (gravity included, ~+9.81 z upright). Reconstruct it.
-        spec_force = specific_force_from_linear_accel(
-            rl_state["linear_accel"], rl_state["projected_gravity"])
+        # hardware.imu_raw_accel: the measured specific force (ACC_DATA) is used directly instead.
+        raw = rl_state.get("specific_force")
+        if raw is not None:
+            spec_force = np.asarray(raw, dtype=np.float64)
+        else:
+            spec_force = specific_force_from_linear_accel(
+                rl_state["linear_accel"], rl_state["projected_gravity"])
 
         pos_rad = self._mapper.robot_deg_to_policy_rad(rl_state["positions"])
 

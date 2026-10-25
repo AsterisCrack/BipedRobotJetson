@@ -48,6 +48,9 @@ class IMUReading:
     quaternion: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)  # w, x, y, z
     euler_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)               # roll, pitch, yaw
     accel: tuple[float, float, float] = (0.0, 0.0, 9.81)                  # m/s² (linear, no gravity)
+    # Raw accelerometer (ACC_DATA 0x08): SPECIFIC FORCE, gravity included (+9.81 z upright), i.e. what the policy
+    # trained on. None unless the driver was built with raw_accel=True.
+    accel_raw: tuple[float, float, float] | None = None
     gyro: tuple[float, float, float] = (0.0, 0.0, 0.0)                    # rad/s
     calibration_status: int = 0                                             # 0-3 (sys calibration)
     stamp: float | None = None  # time.monotonic() of the I2C read that produced this; None = never read
@@ -74,6 +77,7 @@ class BNO055:
     _REG_EUL_H_LSB = 0x1A   # euler heading/roll/pitch (6 bytes)
     _REG_QUA_W_LSB = 0x20   # quaternion W,X,Y,Z (8 bytes)
     _REG_LIA_X_LSB = 0x28   # linear acceleration X,Y,Z (6 bytes)
+    _REG_ACC_X_LSB = 0x08   # raw (calibrated) accelerometer X,Y,Z incl. gravity (6 bytes)
     _REG_CALIB_STAT = 0x35
     _REG_OPR_MODE  = 0x3D
     _REG_PWR_MODE  = 0x3E
@@ -87,12 +91,24 @@ class BNO055:
 
     _MODE_CONFIG = 0x00
     _MODE_NDOF   = 0x0C  # full 9-DOF sensor fusion
+    _MODE_IMUPLUS = 0x08  # accel + gyro fusion, no magnetometer (servo motor fields cannot disturb it)
+    _MODES = {"ndof": 0x0C, "imuplus": 0x08}
+    _ACC_SCALE   = 1.0 / 100.0    # → m/s²
 
     # Read calibration status every N calls (~1 Hz at 50 Hz loop) to avoid
     # a separate I2C transaction on every cycle.
     _CALIB_READ_EVERY = 50
 
-    def __init__(self, i2c_bus: int = 7, address: int = 0x28) -> None:
+    def __init__(self, i2c_bus: int = 7, address: int = 0x28, mode: str = "ndof",
+                 raw_accel: bool = False) -> None:
+        """mode: 'ndof' (9-DOF, magnetometer) or 'imuplus' (accel + gyro only; the policy never uses heading).
+        raw_accel: also read ACC_DATA (one extra 6-byte I2C read) so the policy gets the measured specific force
+        instead of one rebuilt from the fused linear acceleration (2026-10-25 traces: 1-2 m/s^2 LIA jumps with no
+        rotation or joint motion, one right before a fall)."""
+        if mode not in self._MODES:
+            raise ValueError(f"BNO055 mode {mode!r}: expected one of {sorted(self._MODES)}")
+        self._mode = mode
+        self._raw_accel = bool(raw_accel)
         self._bus_num = i2c_bus
         self._address = address
         self._smbus = None
@@ -122,12 +138,12 @@ class BNO055:
         self._write(self._REG_PWR_MODE, 0x00)   # normal power
         time.sleep(0.01)
         self._write(self._REG_PAGE_ID, 0x00)    # page 0
-        self._write(self._REG_OPR_MODE, self._MODE_NDOF)
+        self._write(self._REG_OPR_MODE, self._MODES[self._mode])
         time.sleep(0.025)
 
         logger.info(
-            "BNO055 initialised on I2C bus %d, addr 0x%02X (NDOF fusion mode)",
-            self._bus_num, self._address,
+            "BNO055 initialised on I2C bus %d, addr 0x%02X (%s fusion mode, raw accel %s)",
+            self._bus_num, self._address, self._mode.upper(), "on" if self._raw_accel else "off",
         )
 
     def read(self) -> IMUReading:
@@ -159,6 +175,15 @@ class BNO055:
             az = _s16(bulk[24], bulk[25]) * self._LIA_SCALE
             ay, az = _MOUNT_FLIP_YZ * ay, _MOUNT_FLIP_YZ * az
 
+            acc_raw = None
+            if self._raw_accel:
+                rb = self._smbus.read_i2c_block_data(self._address, self._REG_ACC_X_LSB, 6)
+                rx = _s16(rb[0], rb[1]) * self._ACC_SCALE
+                ry = _s16(rb[2], rb[3]) * self._ACC_SCALE
+                rz = _s16(rb[4], rb[5]) * self._ACC_SCALE
+                ry, rz = _MOUNT_FLIP_YZ * ry, _MOUNT_FLIP_YZ * rz
+                acc_raw = (round(rx, 3), round(ry, 3), round(rz, 3))
+
             # Calibration status — read once every _CALIB_READ_EVERY calls (~1 Hz at 50 Hz)
             self._calib_counter = (self._calib_counter + 1) % self._CALIB_READ_EVERY
             if self._calib_counter == 0:
@@ -169,6 +194,7 @@ class BNO055:
                 quaternion=(round(w, 4), round(x, 4), round(y, 4), round(z, 4)),
                 euler_deg=(round(roll, 2), round(pitch, 2), round(yaw, 2)),
                 accel=(round(ax, 3), round(ay, 3), round(az, 3)),
+                accel_raw=acc_raw,
                 gyro=(round(gx, 4), round(gy, 4), round(gz, 4)),
                 calibration_status=self._cached_sys_cal,
                 stamp=time.monotonic(),

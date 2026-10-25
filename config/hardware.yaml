@@ -4,3 +4,9 @@ i2c_bus: 7
 i2c_address: 0x28  # BNO055 (ADDR pin low)
 uart_timeout_s: 0.005
 max_retries: 3
+# BNO055 (2026-10-25). imu_raw_accel: true feeds the policy the measured accelerometer (specific force, as in training)
+# instead of rebuilding it from the fused linear acceleration, which showed 1-2 m/s^2 jumps with no rotation or joint
+# motion in the hardware traces. imu_mode: imuplus drops the magnetometer (the servos' motor fields disturb NDOF;
+# the policy never uses heading). Both default to the old behaviour.
+imu_mode: ndof          # ndof | imuplus
+imu_raw_accel: false

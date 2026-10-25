@@ -30,6 +30,10 @@ class HardwareConfig(BaseModel):
     baud_rate: int = 1_000_000
     i2c_bus: int = 7
     i2c_address: int = 0x28  # BNO055 default (ADDR pin low)
+    # BNO055 fusion mode: ndof (magnetometer, the old default) | imuplus (accel + gyro, no magnetometer).
+    imu_mode: str = "ndof"
+    # Feed the policy the raw accelerometer (specific force) instead of rebuilding it from fused linear accel.
+    imu_raw_accel: bool = False
     uart_timeout_s: float = 0.05
     max_retries: int = 3
     expect_echo: bool = False

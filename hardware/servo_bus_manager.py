@@ -359,6 +359,7 @@ class ServoBusManager:
             "velocities":        velocities,
             "velocities_deg_s":  velocities_deg_s,
             "linear_accel":      imu.accel,
+            "specific_force":    imu.accel_raw,   # None unless hardware.imu_raw_accel
             "angular_vel":       imu.gyro,
             "projected_gravity": (gx, gy, gz),
         }

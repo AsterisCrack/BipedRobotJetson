@@ -58,6 +58,8 @@ class Robot:
         self._imu = BNO055(
             i2c_bus=settings.hardware.i2c_bus,
             address=settings.hardware.i2c_address,
+            mode=settings.hardware.imu_mode,
+            raw_accel=settings.hardware.imu_raw_accel,
         )
         self._chain = KinematicChain(settings.robot.urdf_path)
         self._solver = KinematicSolver(self._chain)
