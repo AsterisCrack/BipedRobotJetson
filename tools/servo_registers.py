@@ -91,6 +91,17 @@ def _torque_audit(servo: ST3215) -> tuple[int, int, int]:
     return max_torque, torque_limit, prot_current
 
 
+def _deadband_audit(servo: ST3215) -> tuple[int, int]:
+    """Return (CW_DEADBAND 0x1A, CCW_DEADBAND 0x1B), in encoder counts (0.088 deg).
+
+    Inside this dead zone the firmware does not drive. The training sim models it as
+    env_config.actuator.deadband_counts (nominal) / deadband_counts_range (per-servo draw).
+    """
+    cw = servo.read_register(Reg.CW_DEADBAND, 1)[0]
+    ccw = servo.read_register(Reg.CCW_DEADBAND, 1)[0]
+    return cw, ccw
+
+
 def _clear(servo: ST3215) -> tuple[int, int]:
     """Write 0x55 = 0 THEN 0x29 = 0 (order matters), return the verified readback."""
     servo.write_register(Reg.MAX_ACCELERATION, bytes([0]))
@@ -213,6 +224,21 @@ def main() -> int:
                 print(f"\n  At least one servo is capped at {lo:.0%} of full duty. Set "
                       f"env_config.actuator.torque_scale: {lo:.2f} in BipedRobot/config/config.yaml, "
                       f"or raise the limit here.")
+
+        # Firmware dead zone: the sim's actuator.deadband_counts / deadband_counts_range must cover these.
+        print(f"\n  {'servo':<8}{'joint':<22}{'CW_DB 0x1A':>11}{'CCW_DB 0x1B':>12}{'deg':>7}")
+        dbs: list[int] = []
+        for sid in ids:
+            try:
+                cw, ccw = _deadband_audit(ST3215(cfg_map[sid], bus))
+            except SerialBusError as exc:
+                print(f"  {sid:<8}{cfg_map[sid].joint_name:<22}READ FAILED -- {exc}")
+                continue
+            dbs += [cw, ccw]
+            print(f"  {sid:<8}{cfg_map[sid].joint_name:<22}{cw:>11}{ccw:>12}{max(cw, ccw) * 360 / 4096:>7.2f}")
+        if dbs:
+            print(f"\n  Dead zone {min(dbs)}-{max(dbs)} counts. BipedRobot env_config.actuator.deadband_counts_range "
+                  f"must cover [{min(dbs)}, {max(dbs)}].")
 
         if args.clear and capped:
             print("\n  Clearing (0x55 = 0, then 0x29 = 0)...")
