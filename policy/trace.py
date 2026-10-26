@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 
 MAX_STEPS = 15000          # 5 min at 50 Hz, ~10 MB uncompressed
 _FIELDS = ("t", "frame", "action_raw", "action", "targets_rad", "rate_limited",
-           "command", "tilt_rad", "cycle_ms", "infer_ms")
+           "command", "tilt_rad", "cycle_ms", "infer_ms",
+           # per servo, robot config order (fast_mode 0): present load (signed 0.1 % of max), supply V, deg C
+           "servo_load", "servo_voltage", "servo_temp")
 # Trailing shape of each field. A step that omits a field (the fault step has no action) is
 # NaN-filled to this shape, or np.stack in _save fails and the whole trace is lost.
 _SHAPES = {"frame": (50,), "action_raw": (12,), "action": (12,), "targets_rad": (12,),
