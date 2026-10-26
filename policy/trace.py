@@ -37,6 +37,10 @@ _FIELDS = ("t", "frame", "action_raw", "action", "targets_rad", "rate_limited",
            "command", "tilt_rad", "cycle_ms", "infer_ms",
            # per servo, robot config order (fast_mode 0): present load (signed 0.1 % of max), supply V, deg C
            "servo_load", "servo_voltage", "servo_temp")
+# Trailing shape of each field. A step that omits a field (the fault step has no action) is
+# NaN-filled to this shape, or np.stack in _save fails and the whole trace is lost.
+_SHAPES = {"frame": (50,), "action_raw": (12,), "action": (12,), "targets_rad": (12,),
+           "rate_limited": (), "command": (3,), "tilt_rad": (), "cycle_ms": (), "infer_ms": ()}
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+\.npz$")
 
 
@@ -67,7 +71,9 @@ class TraceRecorder:
         try:
             rows["t"].append(time.monotonic() - self._t0)
             for k in _FIELDS[1:]:
-                rows[k].append(np.asarray(values.get(k, np.nan), dtype=np.float32).copy())
+                v = values.get(k)
+                v = np.full(_SHAPES[k], np.nan) if v is None else v
+                rows[k].append(np.asarray(v, dtype=np.float32).copy())
         except Exception:
             logger.exception("trace record failed; dropping this trace")
             self._rows = None
