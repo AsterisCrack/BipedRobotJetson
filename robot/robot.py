@@ -60,6 +60,7 @@ class Robot:
             address=settings.hardware.i2c_address,
             mode=settings.hardware.imu_mode,
             raw_accel=settings.hardware.imu_raw_accel,
+            average_accel=settings.hardware.imu_accel_average,
         )
         self._chain = KinematicChain(settings.robot.urdf_path)
         self._solver = KinematicSolver(self._chain)

@@ -10,3 +10,6 @@ max_retries: 3
 # the policy never uses heading). Both default to the old behaviour.
 imu_mode: ndof          # ndof | imuplus
 imu_raw_accel: false
+# Mean acceleration over each control tick (as training's StepAveragedImu) instead of one instant: removes the
+# foot-impact spikes the policy chattered on (2026-10-25). Default true.
+imu_accel_average: true

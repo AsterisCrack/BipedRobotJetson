@@ -34,6 +34,8 @@ class HardwareConfig(BaseModel):
     imu_mode: str = "ndof"
     # Feed the policy the raw accelerometer (specific force) instead of rebuilding it from fused linear accel.
     imu_raw_accel: bool = False
+    # Average the acceleration over each 20 ms control tick, as in training (StepAveragedImu). Default on.
+    imu_accel_average: bool = True
     uart_timeout_s: float = 0.05
     max_retries: int = 3
     expect_echo: bool = False

@@ -18,6 +18,7 @@ command is silently replaced.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import logging
 import threading
 import time
@@ -56,6 +57,16 @@ class _IMUReaderThread:
         self._read_count = 0
         self._hz_t0 = 0.0
         self._read_hz = 0.0
+        # Acceleration averaged over each control tick (BNO055.average_accel): sums of the reads since the last get().
+        # Training feeds the policy the step-averaged accelerometer (StepAveragedImu); one instantaneous read per tick
+        # hands it every foot-impact spike, and the 2026-10-25 traces chattered on them (MuJoCo: 4 m/s^2 of accel
+        # noise reproduces the hardware's da 0.2/step and 27% rate-limited steps).
+        self._avg = bool(getattr(imu, "average_accel", False))
+        self._acc_lock = threading.Lock()
+        self._acc_sum = [0.0, 0.0, 0.0]
+        self._raw_sum = [0.0, 0.0, 0.0]
+        self._acc_n = 0
+        self._raw_n = 0
 
     def start(self) -> None:
         self._stop.clear()
@@ -70,7 +81,16 @@ class _IMUReaderThread:
         self._thread = None
 
     def get(self) -> IMUReading:
-        return self._latest
+        latest = self._latest
+        if not self._avg:
+            return latest
+        with self._acc_lock:
+            n, rn = self._acc_n, self._raw_n
+            acc = tuple(round(s / n, 3) for s in self._acc_sum) if n else latest.accel
+            raw = tuple(round(s / rn, 3) for s in self._raw_sum) if rn else latest.accel_raw
+            self._acc_sum = [0.0, 0.0, 0.0]; self._raw_sum = [0.0, 0.0, 0.0]
+            self._acc_n = self._raw_n = 0
+        return dataclasses.replace(latest, accel=acc, accel_raw=raw)
 
     def get_read_durations_us(self) -> list[float]:
         """Snapshot copy of recent per-read I2C durations in µs."""
@@ -90,6 +110,15 @@ class _IMUReaderThread:
             t0 = time.monotonic_ns()
             reading = self._imu.read()                      # blocks ~4 ms on I2C
             dt_us = (time.monotonic_ns() - t0) / 1000.0
+            if self._avg and reading is not self._latest:    # a fresh read (a failed one returns the cached object)
+                with self._acc_lock:
+                    for k in range(3):
+                        self._acc_sum[k] += reading.accel[k]
+                    self._acc_n += 1
+                    if reading.accel_raw is not None:
+                        for k in range(3):
+                            self._raw_sum[k] += reading.accel_raw[k]
+                        self._raw_n += 1
             self._latest = reading                           # GIL-atomic reference write
             self._durations.append(dt_us)
             self._read_count += 1

@@ -100,7 +100,7 @@ class BNO055:
     _CALIB_READ_EVERY = 50
 
     def __init__(self, i2c_bus: int = 7, address: int = 0x28, mode: str = "ndof",
-                 raw_accel: bool = False) -> None:
+                 raw_accel: bool = False, average_accel: bool = True) -> None:
         """mode: 'ndof' (9-DOF, magnetometer) or 'imuplus' (accel + gyro only; the policy never uses heading).
         raw_accel: also read ACC_DATA (one extra 6-byte I2C read) so the policy gets the measured specific force
         instead of one rebuilt from the fused linear acceleration (2026-10-25 traces: 1-2 m/s^2 LIA jumps with no
@@ -109,6 +109,9 @@ class BNO055:
             raise ValueError(f"BNO055 mode {mode!r}: expected one of {sorted(self._MODES)}")
         self._mode = mode
         self._raw_accel = bool(raw_accel)
+        # Read by the bus manager's IMU reader thread: hand the policy the MEAN acceleration over each control
+        # tick (all reads since the previous tick), like training's StepAveragedImu, instead of one instant.
+        self.average_accel = bool(average_accel)
         self._bus_num = i2c_bus
         self._address = address
         self._smbus = None
