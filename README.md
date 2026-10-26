@@ -1,766 +1,480 @@
 # BipedRobotJetson
 
-Standalone Python control stack for a 12-DOF biped robot running on a **Jetson Orin Nano**. Features a single web-based control interface accessible from any browser on the local network — no ROS, no separate scripts per operation.
+**The on-robot half of [BipedRobot](https://github.com/AsterisCrack/BipedRobot): a standalone Python
+stack that runs a 12-servo biped from a Jetson Orin Nano.** It talks to the servos and the IMU
+directly, serves a web control panel to any browser on your network, and runs an exported ONNX
+walking policy at 50 Hz with the safety checks a real robot needs. No ROS, no torch, no Isaac Lab.
+
+## Features
+
+- **One web app for everything.** Servo table, IMU readout, 3D robot view with forward/inverse
+  kinematics, single-servo debug, policy control and servo identification, plus a REST + WebSocket API.
+- **From-scratch drivers.** ST3215 (Feetech SCS protocol) over a half-duplex UART with batched
+  SYNC_READ / SYNC_WRITE, and a BNO055 IMU driver, in the standalone [`hardware/`](hardware/README.md) library.
+- **Policy runner and safety.** Loads an ONNX bundle, builds the training observation and runs read, infer,
+  write in one 50 Hz bus cycle, behind an arm/start/stop/e-stop lifecycle, a register audit, tilt,
+  stale-sensor and action-rate limits, a command limiter and a motion lock.
+- **Run traces** of every policy run at 50 Hz, and **no hardware needed** to start the server, so the UI,
+  kinematics and tests work on a laptop.
 
 ---
 
 ## Hardware
 
-| Component | Details |
-|-----------|---------|
-| Computer | NVIDIA Jetson Orin Nano |
-| Servos | 12× ST3215 smart servos (SCS/Feetech protocol, half-duplex UART) |
-| IMU | BNO055 (I2C, register-mapped, addr 0x28) |
-| Legs | 2× 6-DOF (hip yaw/roll/pitch · knee · ankle roll/pitch) |
+A Jetson Orin Nano, 12 Feetech STS3215 servos (2 legs x 6 DOF: hip yaw, roll, pitch, knee, ankle roll,
+ankle pitch) on one shared bus with a 12 V supply, a
+[Waveshare Bus Servo Adapter (A)](https://www.waveshare.com/wiki/Bus_Servo_Adapter_(A)) between the Jetson
+UART and the bus, and a BNO055 IMU on I2C (address `0x28`). Servo IDs and joint names are in
+[`config/robot.yaml`](config/robot.yaml); wiring detail is in [`hardware/README.md`](hardware/README.md).
 
 ---
 
-## Features
+## Install and Jetson setup
 
-- **Servo control** — real-time position, speed, load, voltage, temperature monitoring; per-servo position sliders; torque enable/disable; PID tuning; ID reassignment; zero-point calibration
-- **IMU readouts** — quaternion, Euler angles (roll/pitch/yaw), accelerometer, gyroscope, calibration status, artificial horizon display
-- **Forward kinematics** — computes foot position from current joint angles using transforms extracted directly from the URDF
-- **Inverse kinematics** — numerical IK (DLS — Damped Least Squares) from a target foot position to joint angles, with warm-start from current pose
-- **3D URDF viewer** — live Three.js visualisation of the robot model, updated from servo telemetry at 20 Hz
-- **Pose system** — named poses defined in YAML; one-click execution
-- **WebSocket telemetry** — unified 20 Hz frame to all connected browsers (servos + IMU + foot positions)
-- **REST API** — every operation is also available as a plain HTTP endpoint
-- **RL policy control** — load an exported ONNX policy and drive the robot from it at 50 Hz, with arm/start/stop lifecycle, tilt-fault detection, and operator-confirmed recovery
-
----
-
-## Repository Structure
-
-```
-BipedRobotJetson/
-├── .env                          # Hardware paths (overrides YAML)
-├── config/
-│   ├── hardware.yaml             # UART port, baud rate, I2C bus/address, timeouts
-│   └── robot.yaml                # Servo IDs, zero offsets, PIDs, default poses
-│
-├── hardware/                     # Standalone servo bus + IMU library (no web/robot deps)
-│   ├── README.md                 # Library documentation + usage examples
-│   ├── config.py                 # PIDConfig, ServoConfig, HardwareConfig (Pydantic)
-│   ├── serial_bus.py             # Thread-safe half-duplex UART (echo drain)
-│   ├── servo_bus_manager.py      # 50 Hz SYNC_READ/WRITE bus thread
-│   ├── st3215/
-│   │   ├── registers.py          # Full ST3215 register + instruction map
-│   │   ├── protocol.py           # SCS packet encode/decode, checksum, SYNC_WRITE
-│   │   └── servo.py              # ST3215 driver: position, torque, PID, status
-│   └── imu/
-│       └── bno055.py             # BNO055 driver (quat → Euler, calibration)
-│
-├── kinematics/                   # Standalone FK/IK library (no web/robot/hardware deps)
-│   ├── README.md                 # Library documentation + usage examples
-│   ├── chain.py                  # URDF parser → kinematic chain, FK (Rodrigues)
-│   └── solver.py                 # FK + numerical IK (DLS — Damped Least Squares)
-│
-├── policy/                       # ONNX policy inference (uses hardware/ and robot/)
-│   ├── deploy_config.py          # Loads/validates an exported bundle
-│   ├── observation.py            # Joint permutation, 50-dim frame, history ring, gait clock
-│   ├── policy_runner.py          # ONNX session, EMA filter, arming ramp, per-cycle step()
-│   ├── safety.py                 # Tilt fault, action-rate limit, observation sanity
-│   ├── state_machine.py          # IDLE → ARMING → ARMED → RUNNING → FAULT
-│   └── selftest.py               # Dry run with torque off — run before first arm
-│
-├── robot/                        # Robot orchestrator (uses hardware/ and kinematics/)
-│   ├── config.py                 # RobotConfig + Settings — loads .env + both YAMLs
-│   └── robot.py                  # Robot class: motion, IK, telemetry loop, policy lifecycle
-│
-├── web/                          # Debug web UI (uses robot/ only)
-│   ├── app.py                    # FastAPI factory, lifespan, static mounts
-│   ├── routers/
-│   │   ├── servos.py             # REST /api/servos/*
-│   │   ├── imu.py                # REST /api/imu/*
-│   │   ├── kinematics.py         # REST /api/kinematics/*
-│   │   ├── config.py             # REST /api/config/*
-│   │   └── policy.py             # REST /api/policy/*
-│   ├── websocket.py              # WS broadcaster + command dispatcher
-│   └── static/
-│       ├── index.html            # Single-page app (5 tabs)
-│       ├── css/style.css
-│       └── js/
-│           ├── app.js            # Tab router, central WS manager
-│           ├── servos.js         # Servo tab
-│           ├── imu.js            # IMU tab
-│           ├── robot3d.js        # Three.js viewer, IK/FK sliders, pose buttons
-│           ├── debug.js          # Debug tab — single-servo raw control + telemetry graph
-│           ├── id_manager.js     # Servo ID reassignment page
-│           └── control.js        # Control tab — RL policy arm/drive/monitor
-│
-├── models/                       # Exported ONNX bundles: <name>/policy.onnx + deploy_config.json
-│
-├── tools/
-│   ├── bus_profiler.py           # Bus timing profiler (real ServoBusManager harness)
-│   └── return_delay.py           # Read/zero RETURN_DELAY register on all servos
-│
-├── RobotDescription/
-│   ├── urdf/Robot.urdf           # Robot URDF (source)
-│   └── meshes/*.stl              # Visual/collision meshes
-├── main.py                       # Entry point
-└── requirements.txt
-```
-
-### Dependency Layers
-
-```
-hardware/    ←  no project imports (standalone)
-kinematics/  ←  no project imports (standalone)
-robot/       ←  imports from hardware/ and kinematics/
-policy/      ←  imports from hardware/ (via robot/) — same layer as kinematics/
-web/         ←  imports from robot/ only (never hardware/, kinematics/, or policy/ directly)
-```
-
-`hardware/` and `kinematics/` can be copied into any future project and used independently.
-`policy/` is optional — the server starts without `onnxruntime` installed, with the Control
-tab reporting the feature as unavailable.
-
----
-
-## Installation
-
-### 1. Clone and install dependencies
+### 1. Python dependencies
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/AsterisCrack/BipedRobotJetson
 cd BipedRobotJetson
-pip3 install -r requirements.txt
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt            # pyserial, numpy, scipy, fastapi, uvicorn, pydantic, pyyaml, onnxruntime
+pip install -r requirements-hardware.txt   # Jetson only: Jetson.GPIO + adafruit-blinka (I2C access)
 ```
 
-### 2. Install hardware libraries (Jetson only)
+`onnxruntime` is optional: without it the server starts and the Control tab reports the policy feature
+as unavailable. The CPU execution provider is deliberate, because the actor is a small MLP. The web UI
+loads Three.js from a CDN, so the browser needs internet access.
 
-The Adafruit CircuitPython libraries require the Blinka hardware abstraction layer:
+### 2. Serial port and IMU
+
+The Waveshare adapter uses **straight-through** wiring, not a TX/RX crossover: Jetson pin 8 (TX) to the
+adapter's TX, pin 10 (RX) to RX, pin 6 (GND) to GND. The BNO055 sits on the header's I2C bus 7 (pin 3 = SDA,
+pin 5 = SCL). The header UART is off on a fresh Jetson image. Enable it once, then reboot:
 
 ```bash
-pip3 install -r requirements-hardware.txt
+sudo /opt/nvidia/jetson-io/jetson-io.py     # Configure 40pin header, set pins 8 + 10 to "uarta"
+cat /sys/class/tty/ttyTHS1/uartclk          # after reboot: must be non-zero
+sudo usermod -aG dialout $USER              # then log out and back in
+sudo i2cdetect -y 7                         # the BNO055 should appear at 0x28
 ```
 
-> On a development machine without hardware, these can be skipped — the robot initialises in a degraded mode and the web UI still works.
+A USB-to-SCS adapter works too (`UART_PORT=/dev/ttyUSB0`). The default baud rate is 1 Mbaud.
 
-### 3. Configure hardware paths
+### 3. `.env`
 
-Copy the example env file and edit it to match your Jetson's device nodes:
+Copy the example and uncomment only what you change. Do not put inline comments after a value.
 
 ```bash
 cp .env.example .env
 ```
 
-All variables are optional — uncomment only what you need to change from the defaults:
+| Variable | Default | Meaning |
+|---|---|---|
+| `UART_PORT` | `/dev/ttyTHS1` | Servo bus serial device |
+| `I2C_BUS` | `7` | IMU I2C bus |
+| `BIPED_FAST_MODE` | `0` | How much each servo sends per cycle (below) |
+| `BIPED_RT_SCHEDULING` | off | `1` runs the bus thread with `SCHED_FIFO` priority 10 |
+| `BIPED_DEBUG` | off | Any non-empty value turns on DEBUG logs for `kinematics/`, `robot/` and the bus manager |
 
-```env
-# Hardware paths
-UART_PORT=/dev/ttyTHS1   # or /dev/ttyUSB0 for USB-to-SCS adapter
-I2C_BUS=7                # 40-pin header I2C on Jetson Orin Nano
+**`BIPED_FAST_MODE`** sets how many bytes SYNC_READ pulls per servo. Fields a mode skips read as 0.
 
-# Bus tuning (see "Bus Performance" section below)
-BIPED_RT_SCHEDULING=1    # SCHED_FIFO for the servo bus thread (reduces jitter)
-BIPED_FAST_MODE=2        # 0=full status, 1=position only, 2=position+speed (RL policy)
+| Mode | Fields | Use |
+|---|---|---|
+| `0` | position, speed, load, voltage, temperature | Full UI telemetry, and load/voltage/temperature in traces |
+| `1` | position | Fastest bus, but **the policy refuses to arm**: it has no joint velocity |
+| `2` | position, speed | The slimmest mode the policy accepts, and a shorter bus cycle than mode 0 |
 
-# Debug
-BIPED_DEBUG=1            # DEBUG-level logs for kinematics/ and robot/
-```
-
-Verify hardware is visible:
-
-```bash
-ls /dev/ttyTHS*          # hardware UART
-sudo i2cdetect -y 7      # BNO055 should appear at 0x28
-```
+**`BIPED_RT_SCHEDULING`** reduces timing jitter. It needs `CAP_SYS_NICE` or root
+(`sudo setcap cap_sys_nice+eip $(readlink -f venv/bin/python3)`, silently ignored on `nosuid` filesystems).
+The startup log says whether `SCHED_FIFO` was applied.
 
 ### 4. Run
 
 ```bash
-python3 main.py
+python3 main.py        # web UI + API on http://<jetson-ip>:8080
 ```
 
-Open `http://<jetson-ip>:8080` in any browser on the same network.
+Servo torque is always **off** at startup. The server runs a single worker, because only one process may
+own the serial bus. To start on boot, wrap the same command in a systemd service
+(`WorkingDirectory` = the repo, `ExecStart` = `venv/bin/python main.py`, `Restart=on-failure`,
+`WantedBy=multi-user.target`) and run `sudo systemctl enable --now bipedrobot`.
 
 ---
 
 ## Configuration
 
+Settings are merged at startup from [`config/hardware.yaml`](config/hardware.yaml) (bus and IMU),
+[`config/robot.yaml`](config/robot.yaml) (servos and poses) and `.env` (port, bus and tuning).
+Restart the server after editing any of them.
+
 ### `config/hardware.yaml`
 
 ```yaml
-uart_port: /dev/ttyTHS1
-baud_rate: 1000000        # ST3215 default: 1 Mbps
-i2c_bus: 7
-i2c_address: 0x28         # BNO055 ADDR pin low → 0x28, high → 0x29
-uart_timeout_s: 0.05
+baud_rate: 1000000
+i2c_address: 0x28          # BNO055 ADDR pin low = 0x28, high = 0x29
+uart_timeout_s: 0.005
 max_retries: 3
+imu_mode: ndof             # ndof | imuplus
+imu_raw_accel: false
+imu_accel_average: true
+expect_echo: false         # false for the Waveshare adapter (no TX loopback); not in the shipped file
 ```
+
+`uart_port` and `i2c_bus` also appear in the file, but `.env` (or its defaults) always overrides them, so
+set the port and bus in `.env`.
+
+- **`imu_mode`**: `ndof` fuses the magnetometer, `imuplus` does not. The servos' motor fields can disturb the
+  magnetometer and the policy never uses heading, so try `imuplus` if the orientation drifts.
+- **`imu_raw_accel`**: `true` feeds the policy the measured accelerometer (specific force, as in training);
+  `false` rebuilds it from the fused linear acceleration (see [observation](#observation-frame)).
+- **`imu_accel_average`**: `true` gives the policy the **mean acceleration over each 20 ms tick**, as training
+  does, which removes the foot-impact spikes a single read would hand it.
 
 ### `config/robot.yaml`
 
-Defines all 12 servos and named poses. Each servo entry:
-
 ```yaml
+urdf_path: RobotDescription/urdf/robot_flat.urdf
+home_pose: stand            # the pose the Home button runs
+
 servos:
-  - servo_id: 1                   # physical bus ID (1–253)
-    joint_name: l_hip_yaw         # must match URDF joint name
-    direction_sign: 1             # +1 or -1 — maps servo rotation to URDF convention
-    zero_offset_steps: 2048       # encoder count (0–4095) when joint is at 0°
-    default_position_deg: 0.0
-    pid: {p: 32, d: 16, i: 0}
+  - servo_id: 13
+    joint_name: l_hip_yaw          # must match the URDF joint name
+    direction_sign: 1              # +1 / -1: servo rotation to URDF convention
+    zero_offset_steps: 2048        # encoder count (0-4095) at the joint's zero
+    default_position_deg: -36.0    # standing offset, robot-specific, see below
+    pid: {p: 32, d: 0, i: 0}
+
+poses:                             # named poses, in logical degrees (0 = standing)
+  crouch: {l_hip_pitch_joint: -30.0, l_knee_joint: 60.0}     # ...all 12 joints
 ```
 
-Default servo ID assignment (note ID 13, not 1, for `l_hip_yaw` — historical, from an early
-ID reassignment):
+- **Two angle spaces.** *URDF space* has 0° at the servo's calibrated centre. *Logical space* has 0° at
+  the robot's standing pose: `logical = urdf - default_position_deg`. Poses, the UI sliders and the policy
+  all use logical space. `default_position_deg` is non-zero because the horn mounting offsets the standing
+  pose from URDF zero. **It must be right for every joint**, or every policy observation and target is shifted.
+- **PID is P-only (`d: 0`, `i: 0`) on purpose.** The training servo model is a P-only firmware loop. A
+  bundle states the PID it needs, and `arm()` refuses on a mismatch.
+- `direction_sign` must be exactly `-1` or `1`.
 
-| ID | Joint | Side | `default_position_deg` |
-|----|-------|------|------------------------|
-| 13 | l_hip_yaw | Left | -33.66 |
-| 2 | l_hip_roll_joint | Left | -77.26 |
-| 3 | l_hip_pitch_joint | Left | 37.44 |
-| 4 | l_knee_joint | Left | 134.38 |
-| 5 | l_ankle_roll_joint | Left | -8.70 |
-| 6 | l_ankle_pitch_joint | Left | -21.88 |
-| 7 | r_hip_yaw | Right | -4.75 |
-| 8 | r_hip_roll_joint | Right | -7.56 |
-| 9 | r_hip_pitch_joint | Right | 29.62 |
-| 10 | r_knee_joint | Right | 3.60 |
-| 11 | r_ankle_roll_joint | Right | 5.71 |
-| 12 | r_ankle_pitch_joint | Right | 89.47 |
-
-`default_position_deg` is non-zero here because URDF zero on this build is not the standing
-pose (a physical horn-mounting offset). It defines *logical* zero (`logical = urdf − default_position_deg`),
-which is the space the policy works in — see [RL Policy Deployment](#rl-policy-deployment).
-
-Named poses are defined under `poses:` as a map of joint name → degrees:
-
-```yaml
-poses:
-  stand:
-    l_hip_yaw: 0.0
-    l_knee_joint: 0.0
-    # ... all 12 joints
-  crouch:
-    l_hip_pitch_joint: -30.0
-    l_knee_joint: 60.0
-    l_ankle_pitch_joint: -30.0
-    # ...
-```
+New poses go under `poses:` and appear in the Robot tab automatically.
 
 ---
 
-## Web Interface
+## The web app
 
-### Servos Tab
+Open `http://<jetson-ip>:8080`. Telemetry updates at 20 Hz.
 
-A live table of all 12 servos updated at 20 Hz showing:
+The tabs are **Servos** (live table with position slider, torque toggle, per-servo Zero, PID and ID
+dialogs), **IMU** (orientation, horizon, accelerometer, gyro, calibration status), **Robot** (3D URDF viewer
+driven by the live joints, pose buttons and Home, foot IK and joint FK sliders per leg, a Config panel and
+**Print Config**), **Debug** (ID reassignment, raw single-servo control, rolling telemetry plot), **Control**
+(policy load, arm, start, stop, e-stop, velocity command, auto-recover, safety limits, run traces) and
+**SysID** (servo identification recordings, below).
 
-- **Position °** — current angle with an interactive drag slider; dragging sends a `set_position` command in real time
-- **Speed** — current velocity in steps/s, signed (1 step/s = 0.088 °/s)
-- **Load %** — motor output load (0–100%)
-- **Voltage V** — supply voltage (turns orange/red near limits)
-- **Temp °C** — internal temperature (turns orange/red near limits)
-- **Torque toggle** — enable or disable torque output per servo
-- **Zero** — records the current encoder position as the zero point for that joint
-- **PID** — opens a modal to set P, D, I gains and apply them live
-- **ID** — opens a modal to reassign the servo's bus ID (requires torque off; reconnect after)
+The header's **Sim Mode** switch suppresses all servo writes: commands then move only the 3D model.
 
-The **Enable All / Disable All** buttons control all 12 torques at once.
+The Robot tab's IK is numerical (damped least squares), because the hip offsets rule out a closed form. The
+leg chains are parsed from the URDF by [`kinematics/`](kinematics/README.md), which can be used on its own.
 
-### IMU Tab
+### Calibration
 
-- **Euler angles** — Roll, Pitch, Yaw in degrees
-- **Artificial horizon** — SVG indicator that rotates/tilts with the robot
-- **Quaternion** — W, X, Y, Z components
-- **Accelerometer** — X, Y, Z in m/s²
-- **Gyroscope** — X, Y, Z in rad/s
-- **Calibration dots** — 4 dots (red → green) showing sensor calibration quality (0–3)
-- **Calibrate button** — triggers dynamic calibration mode on the BNO055
+Do this once per build, and again after reseating a horn.
 
-### Robot Tab
+1. Disable all torques and pose the robot by hand at its standing pose.
+2. **Direction.** In the Robot tab, Config panel, toggle each joint's sign until a slider moves the real joint the same way as the 3D model.
+3. **Zero.** In the Debug tab, *Set Current As Zero (config)* writes `zero_offset_steps` to `config/robot.yaml` and resets that joint's `default_position_deg` to 0. The Servos tab's **Zero** button only changes the running session.
+4. **Standing offset.** With the robot in the pose you want as logical zero, click **Set Here** per joint, then **Print Config**. That logs the YAML and writes `/tmp/robot_config.yaml`; copy the servo entries into `config/robot.yaml`.
+5. Restart, then check with the [self-test](#3-self-test-torque-off).
 
-Split view: 3D viewer on the left, controls on the right.
+New servos ship as ID 1: connect **one at a time** and use Debug tab, *Reassign Servo IDs* (torque off), then
+update `config/robot.yaml`.
 
-**3D Viewer**
-- Loads the robot URDF model with STL meshes via Three.js + urdf-loaders (no install needed, loaded from CDN)
-- Joints update live from servo telemetry at 20 Hz
-- Mouse: left-drag to orbit, right-drag to pan, scroll to zoom
+### SysID
 
-**Pose Buttons**
-- One button per named pose defined in `robot.yaml`
-- **Home** button returns to the configured home pose
-
-**IK Sliders (per foot)**
-- X / Y / Z sliders set the target foot position in the base_link frame (metres)
-- On release, IK is solved and the result is sent to the servos atomically via SYNC_WRITE
-- Default ranges: X ±60 mm, Y ±70 mm, Z −180 to −320 mm
-
-**FK Sliders (per leg, collapsible)**
-- One slider per joint (degrees, within URDF joint limits)
-- On release, joint angles are sent directly and the resulting foot position is shown in the console
-
-### Debug Tab
-
-- **Servo picker** — select by ID (scan or manual entry) to make it the "active" servo
-- **Raw controls** — torque toggle and zero-point set for the active servo, in URDF space
-- **Live telemetry graph** — rolling 300-point chart of raw degrees, speed, load %, voltage, and temperature for the active servo
-
-### Control Tab
-
-RL policy arm/drive/monitor — see [RL Policy Deployment](#rl-policy-deployment) below.
+The SysID tab records single-servo runs on a test rig, plus a hysteresis screen of all 12 joints in place,
+in the raw format of Rhoban's [BAM](https://github.com/Rhoban/bam), under `data/sysid/<session>/`. Fitting
+happens in BipedRobot's [`actuator/`](https://github.com/AsterisCrack/BipedRobot/tree/main/actuator). Bench
+trajectories swing ±90°, so they are refused for the robot's own servo IDs unless forced, and a running job
+owns the bus, so the policy cannot arm.
 
 ---
 
-## REST API
+## Deploying a policy
 
-All endpoints return JSON. The base URL is `http://<host>:8080`.
+### 1. Export and copy the bundle
 
-### Servos
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/servos/` | Status of all 12 servos |
-| `GET` | `/api/servos/{id}` | Status of one servo |
-| `POST` | `/api/servos/{id}/position` | `{"deg": 15.0}` — move to position |
-| `POST` | `/api/servos/{id}/torque` | `{"enable": true}` — enable/disable torque |
-| `POST` | `/api/servos/{id}/pid` | `{"p": 32, "d": 16, "i": 0}` — set PID gains |
-| `POST` | `/api/servos/{id}/zero` | Record current position as zero offset |
-| `POST` | `/api/servos/{id}/id` | `{"new_id": 5}` — reassign servo ID |
-| `POST` | `/api/servos/sync_positions` | `{"joints": {"l_knee_joint": 30.0, ...}}` — move multiple joints atomically |
-
-### IMU
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/imu/` | Latest IMU reading |
-| `POST` | `/api/imu/calibrate` | Start dynamic calibration |
-
-### Kinematics
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/kinematics/fk/{leg}` | FK of current joint angles (`left` or `right`) |
-| `POST` | `/api/kinematics/fk/{leg}` | `{"angles_deg": [0,0,0,0,0,0]}` — FK of given angles |
-| `POST` | `/api/kinematics/ik/{leg}` | `{"x": 0.0, "y": 0.021, "z": -0.25, "execute": true}` — solve IK and optionally move |
-| `GET` | `/api/kinematics/poses` | List of named poses |
-| `POST` | `/api/kinematics/poses/{name}` | Execute a named pose |
-| `POST` | `/api/kinematics/home` | Go to home pose |
-
-### Policy
-
-| Method | Path | Description |
-|--------|------|--------------|
-| `GET` | `/api/policy/models` | List bundles found under `models/` (invalid ones included, with their error) |
-| `GET` | `/api/policy/status` | Current state, model, fault, step/timing stats |
-| `POST` | `/api/policy/load` | `{"name": "walk_v1"}` — load a bundle (only while `idle`) |
-| `POST` | `/api/policy/arm` | Goals set to the present pose, torque on, ramp to the bundle's home pose over ~2 s |
-| `POST` | `/api/policy/start` | Hand control to the policy (only from `armed`) |
-| `POST` | `/api/policy/stop` | Stop stepping the policy, keep torque and hold pose |
-| `POST` | `/api/policy/disarm` | Torque off, back to `idle` |
-| `POST` | `/api/policy/estop` | Immediate torque cut from any state — never fails |
-| `POST` | `/api/policy/clear_fault` | Clear a latched fault, back to `idle` |
-| `POST` | `/api/policy/command` | `{"vx": 0.3, "vy": 0.0, "wz": 0.0}` — velocity command, limited server-side (per-axis box, or the bundle's elliptical `command_limit`); the reply has `command` (after velocity scale), `limited` and `limit_shape` |
-| `GET` / `POST` | `/api/policy/safety` | Read/set tilt limit (10–45°), action-rate limit (0.05–2.0), velocity scale (0–1); out of range → 422 |
-| `GET` | `/api/policy/transitions` | Recent state-machine transitions — first place to look after a fault |
-
----
-
-## WebSocket
-
-Connect to `ws://<host>:8080/ws`.
-
-### Server → Client: Telemetry (~20 Hz)
-
-```json
-{
-  "type": "telemetry",
-  "timestamp": 1715000000.123,
-  "servos": [
-    {"id": 1, "joint": "l_hip_yaw", "position_deg": 0.0, "speed": 0,
-     "load": 0, "voltage_v": 7.4, "temperature_c": 32, "torque_enabled": true}
-  ],
-  "imu": {
-    "quaternion": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
-    "euler_deg":  {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
-    "accel":      {"x": 0.0, "y": 0.0, "z": 9.81},
-    "gyro":       {"x": 0.0, "y": 0.0, "z": 0.0},
-    "calibration": 3
-  },
-  "kinematics": {
-    "left_foot":  {"x": -0.001, "y":  0.032, "z": -0.253},
-    "right_foot": {"x": -0.001, "y": -0.032, "z": -0.253}
-  },
-  "policy": {
-    "state": "running", "model": "walk_v1", "fault": null,
-    "steps": 4210, "inference_ms": 0.4, "cycle_ms": 0.6,
-    "tilt_deg": 2.1, "budget_ms": 20.0,
-    "action": [0.12, -0.08, "..."], "targets_deg": {"l_hip_yaw": 3.1, "...": "..."},
-    "gait_phase": 1.57
-  }
-}
-```
-
-`policy` is present once `onnxruntime` is installed, absent otherwise — the Control tab uses
-that to hide itself on a machine without the dependency.
-
-### Client → Server: Commands
-
-```json
-{"type": "set_position",  "servo_id": 1, "position_deg": 15.0}
-{"type": "set_torque",    "servo_id": 1, "enable": true}
-{"type": "set_pid",       "servo_id": 1, "p": 32, "d": 16, "i": 0}
-{"type": "set_pose",      "pose": "stand"}
-{"type": "set_foot_ik",   "leg": "left", "x": 0.0, "y": 0.021, "z": -0.25}
-{"type": "set_joints_fk", "leg": "left", "angles_deg": [0, 0, 0, 0, 0, 0]}
-{"type": "set_velocity_command", "vx": 0.3, "vy": 0.0, "wz": 0.0}
-{"type": "policy_estop"}
-```
-
-`set_velocity_command` and `policy_estop` are also exposed as REST endpoints (`/api/policy/command`,
-`/api/policy/estop`) — the UI fires the e-stop over both transports so it does not depend on
-the socket being healthy.
-
-**Command limit.** The server never trusts the client's command. It limits it to the bundle's trained
-command region: a per-axis box from `command_ranges`, or, when `deploy_config.json` has the optional
-`command_limit` key with `"shape": "ellipse_xy"`, an ellipse in (vx, vy) with `wz` on its own box.
-An over-limit (vx, vy) is scaled back along its direction, so e.g. the corner (0.2, 0.15) with
-vx ±0.2 / vy ±0.15 becomes (0.141, 0.106) instead of the hard corner. Bundles without the key
-behave as before. A non-finite command is treated as zero. After a slider/keyboard
-`set_velocity_command` the server replies `{"type": "command_applied", "command": [vx, vy, wz],
-"shape": ...}` (the limited command, before the velocity scale) and the Control tab shows it;
-`status().command_limit_shape` reports the shape. The gamepad stream is not echoed (its stick mapping
-is already elliptical).
-
----
-
-## ST3215 Servo Driver
-
-The driver implements the **SCS/Feetech serial protocol** from scratch using `pyserial`.
-
-**Packet format:**
-```
-0xFF  0xFF  ID  LEN  INSTR  [PARAMS...]  CHECKSUM
-CHECKSUM = ~(ID + LEN + INSTR + sum(PARAMS)) & 0xFF
-LEN = len(PARAMS) + 2
-```
-
-**Half-duplex handling:** The ST3215 bus is half-duplex — the Jetson's TX bytes loop back on its own RX line. After every write, the driver drains exactly `len(packet)` echo bytes before reading the servo's response.
-
-**SYNC_WRITE:** All motion commands use a single broadcast `SYNC_WRITE` (instruction `0x83`) packet. This sends one packet to all servos simultaneously, ensuring synchronised joint motion without per-servo round-trip latency.
-
-**Unit conversion:**
-```
-steps = zero_offset_steps + direction_sign × angle_deg × (4096 / 360)
-```
-`direction_sign` (+1 or −1) corrects for physical mounting orientation. `zero_offset_steps` is the raw encoder value (0–4095) at the joint's zero angle, configurable via the **Zero** button in the UI.
-
----
-
-## Kinematics
-
-### URDF Parsing
-
-At first run, `robot_flat.urdf` is auto-generated from `Robot.urdf` by stripping the three non-kinematic xacro include lines. The kinematic chain is then parsed using Python's stdlib `xml.etree.ElementTree` — no URDF library dependency.
-
-Each joint's origin transform and rotation axis are extracted directly. The result is two 6-joint chains (left leg and right leg) from `base_link` to the foot end-effector.
-
-### Forward Kinematics
-
-FK is a product of 4×4 homogeneous transforms:
-
-```
-T_foot = T_joint1(θ₁) · T_joint2(θ₂) · ... · T_joint6(θ₆)
-```
-
-Each `T_joint` = `T_origin × R(axis, θ)` using the Rodrigues rotation formula.
-
-**FK at zero angles (from URDF):**
-- Left foot:  `x=−0.001 m, y=+0.032 m, z=−0.253 m`
-- Right foot: `x=−0.001 m, y=−0.032 m, z=−0.253 m`
-
-### Inverse Kinematics
-
-IK uses the **Damped Least Squares (DLS)** method. Analytical IK is not used because the hip joint offsets in this URDF prevent the hip pitch/roll axes from intersecting, which breaks standard closed-form humanoid IK.
-
-Key implementation details:
-- **Warm start** — always initialises from the current joint angles; avoids large jumps and converges to the physically correct branch (knee bending direction)
-- **Multi-start** — retries from the calibrated standing pose if the warm-start solution exceeds 5 mm error
-- **DLS step** — `dq = Jᵀ(JJᵀ + λ²I)⁻¹e`, λ²=0.01; robust near singular configurations
-- **Posture regularisation** — pulls solution toward warm-start to resolve redundancy
-- **Geometric Jacobian** — `J[:, i] = zᵢ × (p_e − pᵢ)`, computed analytically via `fk_all()`
-- **Typical performance** — under 200 iterations, < 5 ms on Jetson
-
----
-
-## RL Policy Deployment
-
-Runs a policy trained in [`BipedRobot`](https://github.com/AsterisCrack/BipedRobot) (Isaac Lab)
-against the real robot, driven from `policy/` inside the 50 Hz bus thread's spare-time slot
-(~16.9 ms/cycle measured, inference is ~0.5 ms).
-
-### 1. Export and copy a bundle
-
-In the `BipedRobot` repo:
+In [BipedRobot](https://github.com/AsterisCrack/BipedRobot):
 
 ```bash
-python -m src.isaaclab.export_onnx --checkpoint checkpoints/my_run/step_5000000.pt
-python -m src.isaaclab.verify_onnx_bundle --bundle exported/my_run_step_5000000
+python -m src.isaaclab.export_onnx --checkpoint checkpoints/<run>/step_<N>.pt
+python -m src.isaaclab.verify_onnx_bundle --bundle exported/<bundle>
+python -m src.mujoco.policy_gate --bundle exported/<bundle>
 ```
 
-Copy the resulting directory here as `models/<name>/` (must contain `policy.onnx` +
-`deploy_config.json`):
+Copy the directory here as `models/<name>/`:
 
-```bash
-cp -r ../BipedRobot/exported/my_run_step_5000000 models/walk_v1
+```
+models/<name>/
+├── policy.onnx             obs [1, 250] -> action [1, 12]
+├── deploy_config.json      normaliser, joint limits, action map, gait clock, limits, required PID
+└── checkpoint_info.json    provenance (optional)
 ```
 
-### 2. Verify the sensor mapping before arming
+`models/walk_v1/` is an early example bundle. The Control tab lists every bundle, including invalid
+ones with their error. Validation is strict and happens at load, not mid-gait.
 
-```bash
-python3 -m policy.selftest --model walk_v1              # live sensors, torque stays off
-python3 -m policy.selftest --model walk_v1 --synthetic  # no hardware needed
-```
+### 2. Bundle format
 
-Prints IMU specific-force reconstruction, projected gravity, tilt, the per-joint
-robot→policy mapping, and the joint targets that *would* be commanded — nothing is written to
-the bus. Run this after any recalibration.
+`deploy_config.json` carries a `format_version`. The runtime accepts v1 to v6 and refuses anything newer.
 
-It also prints the bundle's format version, action map, gait clock and home pose, and (live mode)
-the measured pose against that home with a WARN for any joint more than 10° away — the arm ramp
-will move it there.
-
-**Calibration prerequisite:** the policy works in *logical* space,
-`radians(urdf_deg − default_position_deg)` from `config/robot.yaml`, and its standing/home pose is
-the bundle's `default_joint_pos` (a crouch for residual v4 bundles, 0 for centered/absolute ones) —
-not URDF zero. If `default_position_deg` is wrong, every observation and target is shifted and part
-of the commanded range may be clamped. `selftest.py` flags any joint already outside the policy's limits.
-
-### 3. Arm and drive
-
-From the Control tab, or equivalently:
-
-```bash
-curl -X POST localhost:8080/api/policy/load  -d '{"name":"walk_v1"}' -H 'Content-Type: application/json'
-curl -X POST localhost:8080/api/policy/arm     # torque on, ramps to the bundle home pose over ~2 s
-curl -X POST localhost:8080/api/policy/start   # hands control to the policy
-curl -X POST localhost:8080/api/policy/command -d '{"vx":0.3,"vy":0,"wz":0}' -H 'Content-Type: application/json'
-```
-
-Lifecycle: `IDLE → ARMING → ARMED → RUNNING`, with `FAULT` reachable from any state. `start`
-is only valid from `ARMED` — the policy never begins stepping straight from `IDLE`.
-
-Arming first writes every servo's goal = its present position (at the slow arm speed, torque
-still off), so a stale goal left in the registers cannot make a joint jump when torque comes on;
-if that write fails for any servo the arm is refused. `start` is what resets the policy's runtime
-state: history zero-filled (how every training episode starts), gait phase 0, previous action 0,
-filtered targets at the measured pose.
-
-**Motion lock:** while the policy is `arming`, `armed` or `running`, the endpoints that move or
-reconfigure servos (poses, home, IK execute, servo position/raw position/torque *enable*/PID/zero/
-default position/direction/ID/speed/accel/torque limit, sync positions, and the matching WebSocket
-commands) answer HTTP 409 (WebSocket: an `error` message). Torque *disable*, e-stop, and the policy's
-own endpoints are never locked. `idle` and `fault` are not locked.
-
-### 4. Falls and recovery
-
-Tilt past 45° (`biped_env`'s own termination threshold — the policy has never learned to
-recover past it) cuts torque immediately and latches `FAULT`. So does an e-stop, a stale
-sensor read, a non-finite action, or a sustained loop overrun.
-
-Recovery is always operator-confirmed: `POST /api/policy/clear_fault` → `arm` → `start`. Arming
-only ramps the joints to the home pose and does not touch the observation history; `start` zero-fills
-the history and resets the gait phase, previous action and EMA filter (to the measured pose), the
-same state every training episode starts from. Nothing moves autonomously.
-
-### 5. Bundle format, action map, gait clock, traces
-
-`deploy_config.json` carries `format_version` (v6 is the newest; the runtime refuses anything newer)
-and the **action map**, which must match training exactly:
-
-| `action_map` | Bundle | `target` for action `a ∈ [−1, 1]` |
+| `action_map` | Version | Joint target for action `a` in [-1, 1] |
 |---|---|---|
-| `absolute` | v1 | `min + (a+1)/2 · (max−min)` (`a = 0` = limit midpoint) |
-| `centered` | v2+ | `a = 0` is `default_joint_pos`, `a = ±1` reach each limit |
-| `residual` | v4 | `clamp(home + action_scale_rad · a, min, max)`, `home = default_joint_pos` |
-| `residual`, asymmetric scales | v6 | the same with `action_scale_pos_rad` for `a ≥ 0` and `action_scale_neg_rad` for `a < 0` (no `action_scale_rad`) |
+| `absolute` | v1 | `min + (a+1)/2 * (max-min)` |
+| `centered` | v2 | `a = 0` is the default pose, `±1` reach the limits |
+| `residual` | v4 | `clamp(home + scale * a, min, max)`, with `home = default_joint_pos` |
+| `residual`, asymmetric | v6 | the same with `scale_pos` for `a >= 0` and `scale_neg` for `a < 0` |
 
-The observation's `joint_pos_rel` is `q − default_joint_pos`. **Gait clock** (`gait_clock`): v1/v2
-`speed_proportional` (advances with commanded speed), v3+ `fixed_period` (constant rate `2π/period`,
-held while the command is below `stand_threshold`). The runtime action-rate clip is the bundle's
-`max_action_rate` only if it is > 0, otherwise 0.5; the tilt fault is `min(bundle, 0.784 rad)`.
-Both are re-derived from the defaults on every load. Current training uses no in-env limiter.
+The **gait clock** (`gait_clock`) is the phase input the policy reads: `speed_proportional` (v1/v2),
+`fixed_period` (v3) or `cadence_grid` (v5, where the step frequency follows the command). A bundle may also
+carry a `command_limit` (box or ellipse) and an `actuator` block with the PID it requires. The action map
+must match training exactly, or every action is executed wrongly.
 
-Every `RUNNING` episode is saved to `data/traces/*.npz` (Control tab → *Run traces*). The `meta`
-entry holds what is needed to interpret it offline (re-running the policy still needs the bundle's ONNX
-and normalisation): format version, action map,
-home pose and per-joint scale, joint limits, history size, control rate, EMA alpha and applications,
-gait clock, per-joint `default_position_deg` from `robot.yaml`, actuator block, and the limits in
-force. Format: `policy/trace.py`.
-
-### Sensor/hardware differences the runtime accounts for
-
-| | Isaac Lab (trained on) | This robot |
-|---|---|---|
-| Joint order | interleaved L/R | per-leg (all left, then all right) — permuted **by name**, never by index |
-| IMU accel | specific force, gravity included (~+9.81 z upright) | BNO055 `linear_accel` is gravity-*removed* — reconstructed as `linear_accel − 9.81 × projected_gravity` |
-| Action smoothing | EMA applied 4× per control step (decimation) | replicated as 4 applications, not 1 — applying once leaves the robot measurably laggier |
-| Joint velocity | rad/s | servo `CURRENT_SPEED` register, in steps/s — **sign-magnitude, bit 15 = direction** (decode with `unpack_sign_magnitude16`, not as unsigned), then `direction_sign` applied. Needs `BIPED_FAST_MODE` 0 or 2; the policy refuses to arm under 1 |
-
----
-
-## Bus Performance
-
-The servo bus runs at 50 Hz (20 ms/cycle). Each cycle: SYNC_READ all 12 servos → optionally SYNC_WRITE new targets → get IMU from parallel reader thread → sleep.
-
-**UART timing at 1 Mbps** (10 µs/byte):
-
-| Segment | Bytes | Time |
-|---------|-------|------|
-| SYNC_READ request | 20 | 200 µs |
-| 12 × servo response (8-byte status) | 168 | 1,680 µs |
-| SYNC_WRITE (12 servos) | 68 | 680 µs |
-| **Wire-only minimum** | | **~2.6 ms** |
-
-Measured on Jetson Orin Nano: UART ~2.9 ms, state fetch ~20 µs, spare ~16.9 ms mean (P5: ~16.6 ms). Zero true overruns with SCHED_FIFO.
-
-### Profiler
-
-`tools/bus_profiler.py` is a `ServoBusManager` harness — it runs the same code path as production (SCHED_FIFO, IMU reader thread, SYNC_READ/WRITE) and collects per-phase timing via built-in profiling hooks.
+### 3. Self-test (torque off)
 
 ```bash
-sudo venv/bin/python tools/bus_profiler.py              # 500 cycles, read-only
-sudo venv/bin/python tools/bus_profiler.py --cycles 1000 --write
+python3 -m policy.selftest --model <name>              # live sensors, torque stays off
+python3 -m policy.selftest --model <name> --synthetic  # no hardware
 ```
 
-Reports mean/std/min/max/P5/P95/P99 for: `t_uart_total`, `t_write_w` (if `--write`), `t_state_fetch`, `t_spare`, `t_cycle`. Also shows IMU reader thread I2C timing and two ASCII histograms (wide + jitter-zoomed). Run with `sudo` to apply SCHED_FIFO.
+It prints the bundle's format, action map, gait clock, home pose and command ranges. It then checks that
+`projected_gravity` is a unit vector, that the specific force is about 9.81 m/s², that every joint is inside
+the policy's limits, and how far the measured pose is from the bundle's home (WARN beyond 10° per joint).
+Last, it runs inference and prints the targets that *would* be sent. Nothing is written to the bus. Run it
+**before the first arm and after any recalibration**. It always rebuilds acceleration from the fused linear
+acceleration, so it does not exercise `imu_raw_accel`.
 
-### Return delay
+### 4. Arm, start, drive
 
-`tools/return_delay.py` reads and optionally zeros the `RETURN_DELAY` EEPROM register on all servos. Non-zero values add inter-servo gaps to each SYNC_READ cycle.
+In the Control tab (or through the [API](#api)):
 
-```bash
-sudo venv/bin/python tools/return_delay.py              # read-only
-sudo venv/bin/python tools/return_delay.py --set-zero   # write 0 to all
-```
-
-### Optimizations
-
-Always active:
-
-| Optimization | Effect |
+| Step | What happens |
 |---|---|
-| **Parallel IMU** — dedicated `_IMUReaderThread` reads BNO055 over I2C continuously | removes 4 ms I2C latency from servo cycle |
-| **Batch RX** — one `read(168)` instead of 12 × `read(14)` | −550–1,100 µs/cycle |
-| **No flush()** — `tcdrain` removed from hot path (Jetson L4T adds ~10 ms/call) | −10 ms/cycle |
-| **Single BNO055 bulk read** — registers 0x14–0x2D in one 26-byte I2C transaction | −3 separate I2C calls |
+| **Load** | Pick a bundle (only while idle). The ONNX graph is test-run once. |
+| **Arm** | Audits the servo registers, sets every goal to the present position, turns torque on, then ramps to the bundle's home pose over about 2 s |
+| **Start** | Hands control to the policy. Only valid from `armed`. |
+| **Command** | Sliders, keyboard (WASD/QE) or a gamepad set `vx`, `vy`, `wz` |
+| **Stop** | Back to `armed`: the policy stops, torque and pose are held |
+| **Disarm** | Torque off, back to `idle` |
+| **E-STOP** | Torque off from any state. It cannot fail, and the UI sends it over both REST and WebSocket. |
 
-Opt-in via `.env`:
+The states are `idle`, `arming`, `armed` and `running`. `fault` is reachable from any of them, is latched,
+and is cleared only by the operator.
 
-**`BIPED_RT_SCHEDULING=1`** — applies `SCHED_FIFO` (Linux real-time scheduling, priority 10) to the servo bus thread. Eliminates 1–3 ms P99 spikes from OS preemption. Requires:
+Arming is refused unless all of these hold:
 
-```bash
-sudo setcap cap_sys_nice+eip $(readlink -f venv/bin/python3)
-# or: sudo venv/bin/python main.py
+- every servo replies, and the cached readings are fresh (under 0.15 s old);
+- `BIPED_FAST_MODE` is 0 or 2 (the joint-velocity channel needs the speed register);
+- the servos' own registers match training: acceleration cap cleared (the STS3215 ships with an
+  undocumented cap that makes it too sluggish for a 50 Hz policy; it is also cleared at startup), P/D/I equal
+  to the bundle's required PID, and torque limit 1000;
+- every goal register can first be set to the present pose, so a stale goal cannot make a joint jump when
+  torque comes on;
+- no SysID job is using the bus.
+
+`start` resets the runtime state the way every training episode begins: zero-filled history, gait phase 0,
+previous action 0, filtered targets at the measured pose.
+
+**Motion lock.** While the policy is arming, armed or running, every endpoint that moves or reconfigures
+servos (poses, Home, IK, servo position, torque enable, PID, zero, ID, ...) answers HTTP 409 (WebSocket: an
+`error` message). Torque disable, e-stop and the policy endpoints are never locked.
+
+**Commands.** The server never trusts the client. Each command is clamped to the region the policy was
+trained on (a per-axis box, or an ellipse in vx/vy from the bundle's `command_limit`), then multiplied by the
+velocity scale. A non-finite command becomes zero. A streamed command (gamepad) is zeroed if it is not
+refreshed for 0.5 s, so a closed tab or dropped Wi-Fi cannot leave the robot walking.
+
+**Gamepad.** Runs in the browser (standard mapping): left stick = vx/vy, right stick X = turn,
+**A** arm/start, **B** stop, **X** e-stop, **Y** toggle auto-recover, **View** disarm. Browsers may expose
+gamepads only on secure origins, so over plain `http` use an SSH tunnel (`ssh -L 8080:localhost:8080 <user>@<jetson>`).
+
+**Auto-recover** (off at boot, Control tab). After a *tilt* fault only: it waits until the robot is upright
+(default within 8°) and still for 1 s, then arms, counts down 5 s and starts. Any other fault, disarm or
+e-stop switches it off, and three failed arms in a row disable it. Without it, nothing ever moves on its own.
+
+---
+
+## How the policy loop works
+
+[`ServoBusManager`](hardware/servo_bus_manager.py) owns the serial port in one daemon thread. Each 20 ms
+cycle does a SYNC_READ of all 12 servos (one broadcast), takes the latest cached IMU sample, runs
+`policy.step()` (observation, ONNX, targets) and SYNC_WRITEs the targets in the same cycle. The action
+therefore takes effect with no extra cycle of delay. The IMU is read continuously over I2C by its own thread,
+so the bus thread never waits on it. Most of the 20 ms budget is left for inference; the Control tab's *Loop
+Health* card shows the live numbers.
+
+### Observation frame
+
+One 50-dimensional frame per tick. The actor sees the last 5 frames, oldest first (250 inputs), after a
+two-stage normalisation (stage 1 uses `obs_mean`/`obs_var` from the bundle, stage 2 is baked into the ONNX).
+
+| Slots | Content | Source on this robot |
+|---|---|---|
+| 0:3 | Accelerometer, **specific force** (gravity included, about +9.81 on z upright) | see below |
+| 3:6 | Gyro, rad/s | BNO055 |
+| 6:9 | Projected gravity (unit vector, about `[0, 0, -1]` upright) | BNO055 quaternion |
+| 9:12 | Command `[vx, vy, wz]` | After the command limit and velocity scale |
+| 12:24 | Joint position minus home pose, rad | Servo position, logical space |
+| 24:36 | Joint velocity, rad/s | Servo speed register |
+| 36:48 | Previous action | Last action sent, clipped |
+| 48:50 | `[sin, cos]` of the gait phase | Gait clock |
+
+Conventions the policy depends on, all handled by the runtime:
+
+- **Joint order.** Isaac interleaves left and right; this robot is per leg, so joints are mapped **by name**.
+- **Acceleration.** The policy trained on specific force, but the BNO055's linear-acceleration output has
+  gravity removed, so by default it is rebuilt as `linear_accel - 9.81 * projected_gravity`. With
+  `imu_raw_accel: true` the raw accelerometer is used directly. With `imu_accel_average: true` either one is
+  the mean over all reads in the tick.
+- **Joint velocity** comes from the servo's speed register, far finer than differencing 50 Hz positions. It is
+  sign-magnitude (bit 15 is the direction), and `direction_sign` is applied after decoding.
+- **IMU mounting.** This board is rotated 180° about the forward axis, so the driver negates Y and Z of
+  accel, gyro and projected gravity. The IMU tab's quaternion and Euler angles still show the raw sensor
+  frame. If you remount the IMU, re-check `projected_gravity` with the self-test.
+- **Gait clock.** Advances once per tick, before the frame is built. For `fixed_period` and `cadence_grid`
+  it runs while the command is at or above the bundle's `stand_threshold` (default 0.05) and holds
+  otherwise, at a constant rate or at `freq(command)`. Phase 0 is right-foot touchdown.
+
+### From network output to servo target
+
+1. Clip the action to [-1, 1].
+2. **Rate limiter.** Bound the change per tick: 0.5 by default, the bundle's value if it sets one, operator range 0.05 to 2.0.
+3. Map to joint targets with the bundle's action map, then clamp to the bundle's joint limits.
+4. **Action filter.** An exponential moving average, applied **four times per tick**. Isaac applies it
+   inside its 4-step decimation loop, so the effective gain is `1 - (1-α)^4` (0.87 for α = 0.4), not α.
+5. Write the targets in logical degrees. `Robot` adds `default_position_deg` and converts to servo steps.
+   During policy runs the servo speed is 0 (full speed), since the filter is the rate limiter.
+
+---
+
+## Safety faults
+
+Any fault **cuts torque at once**, latches `FAULT`, closes the run trace and records the reason (the first
+fault wins). Clear it with `clear_fault`, then `arm`, then `start`. Nothing restarts by itself unless
+auto-recover is on.
+
+| Fault | Trigger | What to check |
+|---|---|---|
+| `tilt_exceeded` | Body tilt above the limit (default 45°, the training termination angle; adjustable 10 to 45°, and a bundle can only tighten it). Also checked at the end of the arm ramp. | A real fall, or a wrong IMU mount or calibration. Run the self-test with the robot standing. |
+| `stale_sensor` | Oldest servo or IMU sample older than 0.15 s, or a servo that never replied | Bus power, cabling, a loose servo connector, I2C errors in the log |
+| `bad_observation` | A non-finite value, or any observation value above 100 in magnitude | A unit or sign error, a corrupt read |
+| `inference_error` | The ONNX call raised, or the action was non-finite | The log (the exception is printed) |
+| `loop_overrun` | More than 10 consecutive cycles over the 20 ms budget | CPU load, `BIPED_RT_SCHEDULING`, other processes |
+| `estop` | E-stop pressed | |
+
+`GET /api/policy/transitions` lists recent state changes and is the first place to look after a fault. The
+trace saved with the fault holds the last steps before it.
+
+---
+
+## Run traces
+
+Every `RUNNING` episode, from Start until stop, fault, disarm or e-stop, is recorded at 50 Hz and saved in
+the background to `data/traces/<UTC>_<model>_<reason>.npz` (git-ignored, up to 5 minutes per file). The
+Control tab's *Run traces* card lists and downloads them (`GET /api/policy/traces`).
+
+| Field | Shape | Content |
+|---|---|---|
+| `t` | [T] | Seconds since start |
+| `frame` | [T, 50] | The observation frame the policy saw, in policy joint order |
+| `action_raw`, `action` | [T, 12] | Network output, and after clip and rate limiter |
+| `targets_rad` | [T, 12] | Filtered joint targets sent to the servos (logical rad, policy order) |
+| `rate_limited`, `tilt_rad`, `cycle_ms`, `infer_ms` | [T] | 1 when the limiter changed the action; body tilt; step and inference time |
+| `command` | [T, 3] | Velocity command |
+| `servo_load`, `servo_voltage`, `servo_temp` | [T, 12] | Load (signed, 0.1 % of max, so ±1000 is full torque), supply volts and °C, in `robot.yaml` order |
+| `meta` | JSON string | Bundle info, action map, home pose, scales, joint limits, gait clock, actuator block, `default_position_deg`, limits in force, end reason |
+
+Load, voltage and temperature are only read from the bus with `BIPED_FAST_MODE=0`. In mode 2 they are
+recorded as zeros, so use mode 0 when you want them. A field that is missing on a step (the fault step has
+no action, load or temperature) is NaN, so a trace that ends in a fault has a NaN last row.
+
+```python
+import json, numpy as np
+
+d = np.load("data/traces/<file>.npz")
+meta = json.loads(str(d["meta"]))
+home = np.array(meta["default_joint_pos"])           # rad, policy order
+q = d["frame"][:, 12:24] + home                      # measured joint angles
+err = d["targets_rad"][:-1] - q[1:]                  # tracking error one tick later
+chatter = np.nanmean(d["rate_limited"])              # fraction of ticks the limiter fired
 ```
 
-Note: `setcap` is silently ignored on `nosuid` filesystems (getcap will still show it; use `findmnt -T venv/bin/python3` to check). Running as root bypasses this.
-
-**`BIPED_FAST_MODE`** — how many bytes SYNC_READ pulls per servo from the status block at `0x38`. The registers are contiguous, so a shorter read is just a prefix; whatever is skipped reads as 0. UART time is at 1 Mbps over 12 servos, against a 20 ms cycle.
-
-| Mode | Bytes/servo | Fields | UART | vs mode 0 |
-|---|---|---|---|---|
-| `0` (default) | 8 | pos, speed, load, voltage, temp | 1680 µs | — |
-| `1` | 2 | pos | 960 µs | −720 µs |
-| `2` | 4 | pos, speed | 1200 µs | −480 µs |
-
-**Mode 2 is the one to use when running the policy**: it keeps joint velocity and still drops two thirds of what mode 1 saves. Mode 1 is incompatible with the policy — `PolicyRunner.arm()` and `policy.selftest` both refuse to start under it, because a zero joint_vel channel is in-range and plausible rather than obviously broken. Modes 1 and 2 both blank the load/voltage/temperature columns in the web UI.
+**Debugging the sim-to-real gap.** For chatter, look at the `rate_limited` fraction and whether `action_raw`
+jumps between ticks, and compare `frame[:, 0:3]` (acceleration) and `frame[:, 24:36]` (joint velocity) with
+the simulation's noise model. For sluggish tracking, look for a large, growing `err`, then check `servo_load`
+near ±1000, `servo_voltage` sag and `servo_temp`, and re-check the register audit and the PID. For falls, read
+`tilt_rad`, `command` and the last ~100 steps before the fault. To replay a trace in simulation, use
+BipedRobot's `src/mujoco/policy_gate.py --trace <file>.npz`, which reads the `frame` array.
 
 ---
 
-## Calibrating Servos
+## Tools
 
-Before the first run, each servo's **zero offset** must be set so the software knows where 0° is:
+Run from the repository root. **Stop the web app first**: only one process may own the serial bus.
 
-1. **Physically move the robot to its zero pose** (all joints at their mechanical zero, typically the standing position with legs straight)
-2. **Disable all torques** using the "Disable All Torques" button
-3. For each servo, click **Zero** in the servo table — this reads the current encoder position and saves it as `zero_offset_steps` in memory
-4. The offsets are applied immediately for the current session
-
-To persist offsets across restarts, manually update the `zero_offset_steps` values in `config/robot.yaml` to match what the Zero button read.
-
----
-
-## Changing Servo IDs
-
-New ST3215 servos ship with ID 1. To assign unique IDs:
-
-1. Connect **one servo at a time** to the bus
-2. In the Servos tab, find the servo (it will appear with ID 1)
-3. Click **ID**, enter the desired new ID (1–253), and confirm
-4. **Power cycle the servo** — the ID change is written to EEPROM but takes effect after restart
-5. Update `config/robot.yaml` to reflect the new ID
+| Tool | Purpose |
+|---|---|
+| [`servo_registers.py`](tools/servo_registers.py) | Audit and clear the STS3215 acceleration cap (`0x55`/`0x29`): `--clear`, `--step-test 10` |
+| [`stand_record.py`](tools/stand_record.py) | Arm to the bundle's home pose **without starting the policy** and record while you tap the torso, to measure passive compliance: `--bundle models/<name> [--seconds 20]`. Aborts above 35° of tilt. |
+| [`speed_register_check.py`](tools/speed_register_check.py) | Check the speed register as `joint_vel` (sign, scale, lag, dropouts): `--joints <names> [--mode backdrive\|sweep]`. Sweep drives the joint, so suspend the robot. |
+| [`bus_profiler.py`](tools/bus_profiler.py) | Time the real bus loop per phase: `--cycles N --write`. Run with `sudo` so `SCHED_FIFO` applies. |
+| [`return_delay.py`](tools/return_delay.py) | Read or zero the servos' `RETURN_DELAY` register, which adds dead time to every SYNC_READ: `--set-zero` |
 
 ---
 
-## Jetson Orin Nano Setup Notes
+## API
 
-**UART:**
-- Hardware UART on 40-pin header: `/dev/ttyTHS1` (pins 8/10)
-- Default baud rate: 1 Mbps — supported by Jetson hardware UART
-- Half-duplex requires an external transceiver (e.g. Waveshare Bus Servo Adapter) or a USB-to-SCS adapter (`/dev/ttyUSB0`)
-- Add your user to the `dialout` group: `sudo usermod -aG dialout $USER`
+`http://<host>:8080`, JSON in and out. Every UI action is also an endpoint; the interactive docs are at
+`/docs`.
 
-**I2C:**
-- BNO055 on 40-pin header I2C: bus 7 (pin 3 = SDA, pin 5 = SCL)
-- Verify: `sudo i2cdetect -y 7` — BNO055 should appear at address `0x28` (ADDR pin low)
-- Driver uses `Adafruit_PureIO.smbus` directly — no GPIO or Blinka HAL calls needed
+| Prefix | Endpoints |
+|---|---|
+| `/api/servos` | `GET /`, `/{id}`, `/scan`; `POST /{id}/position` (`{"deg": 15.0}`), `/torque`, `/pid`, `/zero`, `/id`, `/speed`, `/accel`, `/torque_limit`; `POST /sync_positions` (`{"joints": {"l_knee_joint": 30.0}}`) |
+| `/api/imu`, `/api/kinematics` | `GET /api/imu/`, `POST /api/imu/calibrate`; `GET`/`POST /fk/{leg}`, `POST /ik/{leg}` (`{"x": 0.0, "y": 0.021, "z": -0.25, "execute": true}`), `GET /poses`, `POST /poses/{name}`, `POST /home` |
+| `/api/policy` | `GET /models`, `/status`, `/transitions`, `/traces[/{name}]`, `/safety`, `/auto`; `POST /load` (`{"name": "<bundle>"}`), `/arm`, `/start`, `/stop`, `/disarm`, `/estop`, `/clear_fault`, `/command` (`{"vx": 0.1, "vy": 0, "wz": 0}`), `/safety`, `/auto` |
+| `/api/sysid`, `/api/config` | SysID sessions and runs; servo config and `POST /export` |
 
-**Autostart (optional):**
+`POST /api/policy/safety` takes a tilt limit of 10 to 45°, an action rate of 0.05 to 2.0 and a velocity scale
+of 0 to 1; anything outside is a 422. Example: `curl -X POST localhost:8080/api/policy/arm`.
+
+`ws://<host>:8080/ws` pushes a `telemetry` frame at about 20 Hz (`servos`, `imu`, `kinematics` and, with
+`onnxruntime`, `policy`) and accepts `set_position`, `set_torque`, `set_pid`, `set_pose`, `set_foot_ik`,
+`set_joints_fk`, `set_velocity_command` and `policy_estop`.
+
+---
+
+## Tests
 
 ```bash
-# /etc/systemd/system/bipedrobot.service
-[Unit]
-Description=Biped Robot Control
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /home/<user>/BipedRobotJetson/main.py
-WorkingDirectory=/home/<user>/BipedRobotJetson
-Restart=on-failure
-User=<user>
-
-[Install]
-WantedBy=multi-user.target
+pip install pytest
+python -m pytest tests -q          # no hardware needed
 ```
 
-```bash
-sudo systemctl enable bipedrobot
-sudo systemctl start bipedrobot
-```
+The suite covers the policy runtime (arming, action maps, command limit, gait clock, rate limits, stale
+sensors, motion lock, auto-recover, traces) with a stubbed robot. The command-limit and cadence tests compare
+against golden files in `tests/data/` that are shared with BipedRobot, so regenerate both copies together.
 
 ---
 
-## Development Without Hardware
+## Project structure
 
-The server starts in a degraded mode if the serial port or IMU is unavailable — it logs a warning and continues. The web UI, kinematics, and REST API all work normally; servo status reads return zeros and IMU returns a static identity quaternion.
-
-To run locally:
-
-```bash
-pip3 install -r requirements.txt   # no adafruit-blinka needed
-python3 main.py
-# → http://localhost:8080
-```
+`main.py` starts the robot and the web app. `config/` holds the YAML files, `hardware/` the servo bus and IMU
+library, `kinematics/` the URDF-based FK/IK, `robot/` the orchestrator (angle spaces, motion, telemetry,
+SysID), `policy/` the ONNX runtime, `web/` the FastAPI app and static UI, `tools/` the diagnostics, `models/`
+the policy bundles and `RobotDescription/` the URDF and meshes. Layers import only downward, so `hardware/`
+and `kinematics/` can be copied into other projects.
 
 ---
 
-## Dependencies
+## License
 
-| Package | Purpose |
-|---------|---------|
-| `pyserial` | UART communication with ST3215 servos |
-| `numpy` | Kinematics matrix math |
-| `scipy` | Numerical IK optimisation |
-| `fastapi` | Web framework and REST API |
-| `uvicorn` | ASGI server |
-| `pydantic` + `pydantic-settings` | Config models and `.env` loading |
-| `pyyaml` | YAML config file parsing |
-| `onnxruntime` | RL policy inference (CPU execution provider — plenty for a 250→1024→512→256→12 MLP against a ~16.9 ms/cycle budget) *(optional)* |
-| `Jetson.GPIO` | Jetson GPIO HAL (required by adafruit-blinka for platform detection) *(hardware only)* |
-| `adafruit-blinka` | Provides `Adafruit_PureIO.smbus` for direct I2C register access *(hardware only)* |
-
-Three.js and urdf-loader are loaded from CDN at runtime — no npm or build step required.
+[MIT](LICENSE)

@@ -579,8 +579,8 @@ class PolicyRunner:
             command=command, tilt_rad=tilt,
             cycle_ms=self._cycle_ms[-1] if self._cycle_ms else np.nan,
             infer_ms=self._infer_ms[-1] if self._infer_ms else np.nan,
-            servo_load=rl_state.get("loads", np.nan), servo_voltage=rl_state.get("voltages", np.nan),
-            servo_temp=rl_state.get("temperatures", np.nan))
+            servo_load=rl_state.get("loads"), servo_voltage=rl_state.get("voltages"),
+            servo_temp=rl_state.get("temperatures"))
 
         self.safety.note_cycle_time(
             self._cycle_ms[-1] / 1000.0 if self._cycle_ms else 0.0, cfg.step_dt)

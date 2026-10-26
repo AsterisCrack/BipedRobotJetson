@@ -610,7 +610,7 @@ class ServoBusManager:
                 raw_steps=pos_steps,
                 raw_deg=round(pos_steps / (4096.0 / 360.0), 2),
                 speed=unpack_sign_magnitude16(data, 2) if n >= Reg.STATUS_LEN_POS_SPEED else 0,
-                load=unpack_sign_magnitude16(data, 4) if n >= Reg.STATUS_LEN else 0,
+                load=unpack_sign_magnitude16(data, 4, sign_bit=10) if n >= Reg.STATUS_LEN else 0,
                 voltage_v=round(data[6] * 0.1, 2) if n >= Reg.STATUS_LEN else 0.0,
                 temperature_c=data[7] if n >= Reg.STATUS_LEN else 0,
                 torque_enabled=servo.torque_enabled,

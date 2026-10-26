@@ -210,7 +210,7 @@ class ST3215:
         data = self.read_register(Reg.STATUS_START, Reg.STATUS_LEN)
         pos_steps = bytes_to_steps(data, 0)
         speed = unpack_sign_magnitude16(data, 2)
-        load = unpack_sign_magnitude16(data, 4)
+        load = unpack_sign_magnitude16(data, 4, sign_bit=10)  # STS: direction is BIT10 (SDK ReadLoad: scs_tohost(v, 10))
         voltage_raw = data[6]
         temp = data[7]
         return ServoStatus(

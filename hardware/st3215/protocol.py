@@ -132,8 +132,8 @@ def unpack_sign_magnitude16(data: bytes, offset: int = 0, sign_bit: int = 15) ->
     """Unpack a SIGN-MAGNITUDE 16-bit value: sign_bit is direction, rest is magnitude.
 
     NOT two's complement -- use this, not unpack_s16, for CURRENT_SPEED and
-    CURRENT_LOAD. Feetech's own SDK does the same (`sts_tohost(v, 15)`), and reading
-    these as unsigned turns any negative value v into 32768 + |v|.
+    CURRENT_LOAD. Feetech's own SDK does the same: speed is `sts_tohost(v, 15)`, LOAD is
+    `sts_tohost(v, 10)` (pass sign_bit=10; with 15 a negative load -v reads as 1024 + v).
     """
     raw = unpack_u16(data, offset)
     mask = 1 << sign_bit

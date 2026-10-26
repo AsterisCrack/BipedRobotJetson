@@ -40,7 +40,8 @@ _FIELDS = ("t", "frame", "action_raw", "action", "targets_rad", "rate_limited",
 # Trailing shape of each field. A step that omits a field (the fault step has no action) is
 # NaN-filled to this shape, or np.stack in _save fails and the whole trace is lost.
 _SHAPES = {"frame": (50,), "action_raw": (12,), "action": (12,), "targets_rad": (12,),
-           "rate_limited": (), "command": (3,), "tilt_rad": (), "cycle_ms": (), "infer_ms": ()}
+           "rate_limited": (), "command": (3,), "tilt_rad": (), "cycle_ms": (), "infer_ms": (),
+           "servo_load": (12,), "servo_voltage": (12,), "servo_temp": (12,)}
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+\.npz$")
 
 

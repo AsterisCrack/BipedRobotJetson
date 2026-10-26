@@ -206,7 +206,7 @@ class SysidJob:
                         "timestamp": t,
                         "position": (bytes_to_steps(data, 0) - self.zero_steps) * RAD_PER_STEP,
                         "speed": unpack_sign_magnitude16(data, 2) * RAD_PER_STEP,
-                        "load": float(unpack_sign_magnitude16(data, 4)),
+                        "load": float(unpack_sign_magnitude16(data, 4, sign_bit=10)),
                         "input_volts": data[6] * 0.1,
                         "temp": float(data[7]),
                         "goal_position": goal,
