@@ -36,12 +36,15 @@ MAX_STEPS = 15000          # 5 min at 50 Hz, ~10 MB uncompressed
 _FIELDS = ("t", "frame", "action_raw", "action", "targets_rad", "rate_limited",
            "command", "tilt_rad", "cycle_ms", "infer_ms",
            # per servo, robot config order (fast_mode 0): present load (signed 0.1 % of max), supply V, deg C
-           "servo_load", "servo_voltage", "servo_temp")
+           "servo_load", "servo_voltage", "servo_temp",
+           # per servo, robot config order: age of its last fresh SYNC_READ reply (names a stale_sensor culprit)
+           "servo_age_ms")
 # Trailing shape of each field. A step that omits a field (the fault step has no action) is
 # NaN-filled to this shape, or np.stack in _save fails and the whole trace is lost.
 _SHAPES = {"frame": (50,), "action_raw": (12,), "action": (12,), "targets_rad": (12,),
            "rate_limited": (), "command": (3,), "tilt_rad": (), "cycle_ms": (), "infer_ms": (),
-           "servo_load": (12,), "servo_voltage": (12,), "servo_temp": (12,)}
+           "servo_load": (12,), "servo_voltage": (12,), "servo_temp": (12,),
+           "servo_age_ms": (12,)}
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+\.npz$")
 
 

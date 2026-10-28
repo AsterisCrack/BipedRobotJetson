@@ -122,3 +122,27 @@ def test_imu_stamp_set_on_success_and_kept_on_fallback():
     time.sleep(0.01)
     r2 = imu.read()
     assert r2.stamp == r1.stamp                    # fallback does not refresh
+
+
+def test_servo_ages_name_the_stale_servo():
+    m = _manager()
+    assert all(math.isnan(a) for a in m.get_rl_state()["servo_ages_ms"])
+    m._update_state({1: _status(1), 2: _status(2)}, IMUReading())
+    m._servo_stamps[2] -= 0.2                     # servo 2 last replied 200 ms ago
+    ages = m.get_rl_state()["servo_ages_ms"]
+    assert ages[0] < 50.0 and 190.0 < ages[1] < 260.0
+
+
+def test_dropout_logged_once_and_recovery_logged(caplog):
+    import logging
+    import hardware.servo_bus_manager as sbm
+    m = _manager()
+    caplog.set_level(logging.WARNING, logger=sbm.logger.name)
+    for _ in range(sbm._MISS_LOG_AFTER + 4):      # servo 2 silent
+        m._track_misses({1: _status(1)})
+    missing = [r for r in caplog.records if "missing from" in r.getMessage()]
+    assert len(missing) == 1 and "servo 2 (j2)" in missing[0].getMessage()
+    m._track_misses({1: _status(1), 2: _status(2)})
+    back = [r for r in caplog.records if "replying again" in r.getMessage()]
+    assert len(back) == 1 and f"after {sbm._MISS_LOG_AFTER + 4} missed" in back[0].getMessage()
+    assert m._consec_miss[2] == 0

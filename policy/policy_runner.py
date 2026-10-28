@@ -169,6 +169,19 @@ class PolicyRunner:
     def _robot_joint_names(self) -> list[str]:
         return [s.joint_name for s in self._robot._bus_manager._servos]
 
+    def _stale_source(self, rl_state: dict) -> str:
+        """' (oldest: servo <id> <joint> <age> ms, imu <age> ms)' for a stale_sensor fault detail."""
+        now = time.monotonic()
+        ages = rl_state.get("servo_ages_ms") or []
+        servos = self._robot._bus_manager._servos
+        parts = []
+        if ages and np.any(np.isfinite(ages)):
+            i = int(np.nanargmax(ages))
+            parts.append(f"servo {servos[i].servo_id} {servos[i].joint_name} {ages[i]:.0f} ms")
+        imu = rl_state.get("imu_stamp")
+        parts.append(f"imu {(now - imu) * 1000.0:.0f} ms" if imu is not None else "imu never")
+        return " (oldest: " + ", ".join(parts) + ")"
+
     def _robot_default_offsets(self) -> dict[str, float]:
         return {s.joint_name: float(getattr(s, "default_position_deg", 0.0))
                 for s in self._robot._bus_manager._servos}
@@ -335,6 +348,9 @@ class PolicyRunner:
             "model": cfg.name, "model_info": cfg.info,
             "format_version": cfg.format_version,
             "joint_names": list(cfg.joint_names),
+            # servo_load / servo_voltage / servo_temp / servo_age_ms are in SERVO CONFIG order (robot.yaml), not
+            # joint_names order. Only the first and last entries coincide for the current robot.
+            "servo_joint_names": self._robot_joint_names(),
             "history_size": cfg.history_size,
             "control_hz": cfg.control_hz,
             "step_dt": cfg.step_dt, "action_map": cfg.action_map,
@@ -529,6 +545,8 @@ class PolicyRunner:
         tilt = tilt_from_projected_gravity(rl_state["projected_gravity"])
         age = sensor_age(time.monotonic(), rl_state["servo_stamp"], rl_state["imu_stamp"])
         fault = self.safety.check_observation(frame, rl_state["projected_gravity"], age)
+        if fault == FaultReason.STALE_SENSOR:
+            self.safety.state.fault_detail += self._stale_source(rl_state)
         if not fault and rl_state["servo_missing"]:
             self.safety.trigger(FaultReason.STALE_SENSOR,
                                 f"servos never replied: {rl_state['servo_missing']}")
@@ -579,7 +597,7 @@ class PolicyRunner:
             command=command, tilt_rad=tilt,
             cycle_ms=self._cycle_ms[-1] if self._cycle_ms else np.nan,
             infer_ms=self._infer_ms[-1] if self._infer_ms else np.nan,
-            servo_load=rl_state.get("loads"), servo_voltage=rl_state.get("voltages"),
+            servo_load=rl_state.get("loads"), servo_voltage=rl_state.get("voltages"), servo_age_ms=rl_state.get("servo_ages_ms"),
             servo_temp=rl_state.get("temperatures"))
 
         self.safety.note_cycle_time(
