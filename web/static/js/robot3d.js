@@ -273,7 +273,7 @@ function _initScene() {
   gyroArrows  = _makeArrowTriad(bodyFrame, GYRO_ORIGIN_Z);
 
   const loader = new URDFLoader();
-  loader.packages = { RobotDescription: '/robot_description' };
+  loader.packages = { Robot_description: '/robot_description' };
   loader.load('/robot_description/urdf/robot_flat.urdf', obj => {
     robot3d = obj;
     bodyFrame.add(robot3d);

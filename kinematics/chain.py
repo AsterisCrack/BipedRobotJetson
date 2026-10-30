@@ -166,7 +166,7 @@ def _ensure_flat_urdf(urdf_path: str) -> str:
     content = src.read_text()
     # Remove xacro namespace declaration and include lines
     content = re.sub(r'\s*xmlns:xacro="[^"]*"', "", content)
-    content = re.sub(r'[ \t]*<xacro:include[^>]*/>\n?', "", content)
+    content = re.sub(r'[ \t]*<xacro:include[^>]*?(?:/>|>\s*</xacro:include>)\n?', "", content)
 
     # Atomic write: write to a temp file then rename so a crash cannot
     # leave a partially-written robot_flat.urdf.

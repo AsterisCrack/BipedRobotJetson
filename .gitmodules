@@ -1,0 +1,4 @@
+[submodule "robot_hardware"]
+	path = robot_hardware
+	url = https://github.com/AsterisCrack/BipedRobotHardware.git
+	shallow = true

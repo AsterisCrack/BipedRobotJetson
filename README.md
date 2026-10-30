@@ -26,6 +26,8 @@ ankle pitch) on one shared bus with a 12 V supply, a
 [Waveshare Bus Servo Adapter (A)](https://www.waveshare.com/wiki/Bus_Servo_Adapter_(A)) between the Jetson
 UART and the bus, and a BNO055 IMU on I2C (address `0x28`). Servo IDs and joint names are in
 [`config/robot.yaml`](config/robot.yaml); wiring detail is in [`hardware/README.md`](hardware/README.md).
+CAD, print files, BOM, PCB and the build guide are in
+[BipedRobotHardware](https://github.com/AsterisCrack/BipedRobotHardware).
 
 ---
 
@@ -34,8 +36,9 @@ UART and the bus, and a BNO055 IMU on I2C (address `0x28`). Servo IDs and joint 
 ### 1. Python dependencies
 
 ```bash
-git clone https://github.com/AsterisCrack/BipedRobotJetson
+git clone --recurse-submodules https://github.com/AsterisCrack/BipedRobotJetson   # also pulls the URDF (BipedRobotHardware)
 cd BipedRobotJetson
+git submodule update --init      # existing checkouts: after pulling, fetch the URDF submodule
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt            # pyserial, numpy, scipy, fastapi, uvicorn, pydantic, pyyaml, onnxruntime
 pip install -r requirements-hardware.txt   # Jetson only: Jetson.GPIO + adafruit-blinka (I2C access)
@@ -133,7 +136,7 @@ set the port and bus in `.env`.
 ### `config/robot.yaml`
 
 ```yaml
-urdf_path: RobotDescription/urdf/robot_flat.urdf
+urdf_path: robot_hardware/robot_description/urdf/robot_flat.urdf
 home_pose: stand            # the pose the Home button runs
 
 servos:
@@ -470,7 +473,8 @@ against golden files in `tests/data/` that are shared with BipedRobot, so regene
 `main.py` starts the robot and the web app. `config/` holds the YAML files, `hardware/` the servo bus and IMU
 library, `kinematics/` the URDF-based FK/IK, `robot/` the orchestrator (angle spaces, motion, telemetry,
 SysID), `policy/` the ONNX runtime, `web/` the FastAPI app and static UI, `tools/` the diagnostics, `models/`
-the policy bundles and `RobotDescription/` the URDF and meshes. Layers import only downward, so `hardware/`
+the policy bundles and `robot_hardware/` the URDF and meshes (the
+[BipedRobotHardware](https://github.com/AsterisCrack/BipedRobotHardware) submodule, shared with BipedRobot). Layers import only downward, so `hardware/`
 and `kinematics/` can be copied into other projects.
 
 ---

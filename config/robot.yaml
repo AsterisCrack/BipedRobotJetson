@@ -1,4 +1,4 @@
-urdf_path: "RobotDescription/urdf/robot_flat.urdf"
+urdf_path: "robot_hardware/robot_description/urdf/robot_flat.urdf"  # BipedRobotHardware submodule
 home_pose: stand
 
 # Servo ID assignment:

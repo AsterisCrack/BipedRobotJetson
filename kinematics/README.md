@@ -43,7 +43,7 @@ R = I + sin(θ)·K + (1 − cos(θ))·K²    where K = [axis]×  (skew-symmetric
 ```python
 from kinematics.chain import KinematicChain
 
-chain = KinematicChain("RobotDescription/urdf/Robot.urdf")
+chain = KinematicChain("robot_hardware/robot_description/urdf/Robot.urdf")
 
 # FK: angles in radians, returns 4×4 transform
 import math
@@ -125,7 +125,7 @@ from kinematics.solver import KinematicSolver
 import numpy as np
 
 # Load URDF (generates robot_flat.urdf if needed)
-chain = KinematicChain("RobotDescription/urdf/Robot.urdf")
+chain = KinematicChain("robot_hardware/robot_description/urdf/Robot.urdf")
 solver = KinematicSolver(chain)
 
 # Forward kinematics — angles in degrees, URDF space

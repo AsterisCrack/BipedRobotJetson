@@ -11,7 +11,7 @@ from hardware.config import HardwareConfig, PIDConfig, ServoConfig  # noqa: F401
 
 
 class RobotConfig(BaseModel):
-    urdf_path: str = "RobotDescription/urdf/robot_flat.urdf"
+    urdf_path: str = "robot_hardware/robot_description/urdf/robot_flat.urdf"
     home_pose: str = "stand"
     servos: list[ServoConfig] = Field(default_factory=list)
     poses: dict[str, dict[str, float]] = Field(default_factory=dict)

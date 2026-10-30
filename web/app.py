@@ -14,7 +14,7 @@ from web.websocket import TelemetryBroadcaster
 logger = logging.getLogger(__name__)
 
 _STATIC = Path(__file__).parent / "static"
-_ROBOT_DESC = Path(__file__).parent.parent / "RobotDescription"
+_ROBOT_DESC = Path(__file__).parent.parent / "robot_hardware" / "robot_description"
 
 
 def create_app(robot) -> FastAPI:
